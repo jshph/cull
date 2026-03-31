@@ -45,8 +45,7 @@ fn decode_jpeg(jpeg: Vec<u8>, max_dim: u32) -> Result<egui::ColorImage> {
 // ── full preview extraction (existing logic) ──────────────────────────────
 
 fn extract_full_jpeg(path: &Path) -> Result<Vec<u8>> {
-    let ext = ext(path);
-    if matches!(ext, "jpg" | "jpeg") {
+    if matches!(ext(path).as_str(), "jpg" | "jpeg") {
         return Ok(std::fs::read(path)?);
     }
     let data = std::fs::read(path)?;
@@ -63,9 +62,12 @@ fn extract_full_jpeg(path: &Path) -> Result<Vec<u8>> {
 /// Try to extract a tiny embedded thumbnail without decoding the full preview.
 /// Returns None on any failure — caller falls back to full decode.
 fn extract_tiny_jpeg(path: &Path) -> Option<Vec<u8>> {
-    match ext(path) {
+    match ext(path).as_str() {
         "jpg" | "jpeg" => {
-            // Standalone JPEGs may have an EXIF thumbnail in APP1
+            // Standalone JPEGs may have an EXIF thumbnail in APP1.
+            // Camera-original JPEGs (Fuji, Canon, Sony, iPhone) always do.
+            // Lightroom/Capture One exports usually do too.
+            // We only read the first 64 KB — APP markers come before image data.
             let data = read_first_bytes(path, 65536)?;
             exif_thumbnail_in_jpeg(&data)
         }
@@ -152,15 +154,15 @@ fn extract_raf_tiny(path: &Path) -> Option<Vec<u8>> {
     f.read_exact(&mut hdr).ok()?;
     if !hdr.starts_with(b"FUJIFILMCCD-RAW") { return None; }
 
-    // Try standard offset 0x54 first, then 0x44 for older bodies
+    // Try standard offset 0x54 (84) first, then 0x44 (68) for older bodies.
+    // RAF is always big-endian.
     let jpeg_off = [84usize, 68]
         .iter()
         .filter_map(|&o| {
-            let v = rd32(&hdr[o..], false)?; // RAF is always big-endian
+            let v = rd32(&hdr[o..], false)?;
             if v > 0 { Some(v as u64) } else { None }
         })
         .find(|&off| {
-            // Quick-validate: seek there and check JPEG magic
             f.seek(SeekFrom::Start(off)).ok();
             let mut magic = [0u8; 2];
             f.read_exact(&mut magic).ok();
@@ -292,12 +294,12 @@ fn jpeg_end(data: &[u8], start: usize) -> Option<usize> {
 
 // ── helpers ───────────────────────────────────────────────────────────────
 
-fn ext(path: &Path) -> &str {
-    path.extension().and_then(|e| e.to_str()).map(|e| {
-        // safe: we hand out a reference to a static or owned slice
-        // Actually, we need to be careful here. Let me use a match.
-        e
-    }).unwrap_or("")
+/// Lowercase file extension — cameras often write .JPG, .ARW, .RAF uppercase.
+fn ext(path: &Path) -> String {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_lowercase())
+        .unwrap_or_default()
 }
 
 fn read_first_bytes(path: &Path, n: usize) -> Option<Vec<u8>> {
