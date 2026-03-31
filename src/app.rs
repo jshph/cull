@@ -62,9 +62,7 @@ pub struct CullApp {
 
     /// Explorer sidebar visibility
     show_explorer: bool,
-    /// Subdirectories of the current folder's root (computed lazily)
-    explorer_dirs: Vec<PathBuf>,
-    /// Root for the explorer (parent of current folder, or the folder itself)
+    /// Root directory for the explorer tree (parent of current folder)
     explorer_root: Option<PathBuf>,
 }
 
@@ -103,7 +101,6 @@ impl CullApp {
             filmstrip_vis: (0, 0),
             filmstrip_height: 108.0,
             show_explorer: false,
-            explorer_dirs: Vec::new(),
             explorer_root: None,
         };
 
@@ -127,9 +124,8 @@ impl CullApp {
         self.status = format!("{count} images");
         self.needs_scroll = true;
 
-        // Set explorer root to the parent (so sibling folders are visible)
+        // Explorer root = parent of current folder (shows siblings in tree)
         let explorer_root = path.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| path.clone());
-        self.explorer_dirs = list_subdirs(&explorer_root);
         self.explorer_root = Some(explorer_root);
         self.folder = Some(path);
     }
@@ -331,9 +327,11 @@ impl eframe::App for CullApp {
         }
 
         // 6. Render
-        let visible = self.visible_indices();
+        //    render_explorer may navigate to a new folder, changing self.images.
+        //    Recompute visible after explorer so filmstrip/main use fresh indices.
         self.render_toolbar(ctx);
         self.render_explorer(ctx);
+        let visible = self.visible_indices();
         self.render_filmstrip(ctx, &visible, shift, cmd);
         self.render_main(ctx, &visible);
     }
@@ -423,8 +421,10 @@ impl CullApp {
         if !self.show_explorer { return; }
 
         let current_folder = self.folder.clone();
-        let dirs = self.explorer_dirs.clone();
+        let root = self.explorer_root.clone();
+        let sel_n = self.selected_set.len();
         let mut navigate_to: Option<PathBuf> = None;
+        let mut move_to: Option<PathBuf> = None;
 
         egui::SidePanel::left("explorer")
             .resizable(true)
@@ -432,70 +432,42 @@ impl CullApp {
             .min_width(140.0)
             .max_width(400.0)
             .show(ctx, |ui| {
-                ui.heading("Folders");
-                ui.separator();
-
-                // Show parent (..) navigation
-                if let Some(root) = &self.explorer_root.clone() {
-                    if let Some(parent) = root.parent() {
-                        if ui.selectable_label(false, "⬆ ..").clicked() {
-                            navigate_to = Some(parent.to_path_buf());
-                        }
-                    }
-                }
-
-                ScrollArea::vertical().show(ui, |ui| {
-                    for dir in &dirs {
-                        let dir_name = dir.file_name()
-                            .and_then(|n| n.to_str())
-                            .unwrap_or("?");
-
-                        let is_current = current_folder.as_ref() == Some(dir);
-
-                        let label = if is_current {
-                            format!("▸ {dir_name}")
-                        } else {
-                            format!("  {dir_name}")
-                        };
-
-                        let response = ui.selectable_label(is_current, &label);
-
-                        // Click to navigate into that folder
-                        if response.clicked() && !is_current {
-                            navigate_to = Some(dir.clone());
-                        }
-
-                        // Drop target — move selected images into this folder
-                        if !is_current {
-                            let drop_response = response.on_hover_text("Drop selected images here");
-                            if drop_response.hovered() && ctx.input(|i| i.pointer.any_released()) {
-                                // Check if we were dragging (had a selection and released over this)
-                                // For now, show as a potential drop target
+                // Header with root path
+                if let Some(root) = &root {
+                    let root_name = root.file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("…");
+                    ui.horizontal(|ui| {
+                        // Up button
+                        if let Some(parent) = root.parent() {
+                            if ui.small_button("⬆").on_hover_text("Go up one level").clicked() {
+                                navigate_to = Some(parent.to_path_buf());
                             }
                         }
-                    }
-                });
-
-                ui.separator();
-
-                // Move-to button for selected images
-                if self.selected_set.len() > 0 && !dirs.is_empty() {
-                    ui.label(format!("{} selected", self.selected_set.len()));
-                    ui.horizontal_wrapped(|ui| {
-                        for dir in &dirs {
-                            let is_current = current_folder.as_ref() == Some(dir);
-                            if is_current { continue; }
-                            let name = dir.file_name()
-                                .and_then(|n| n.to_str())
-                                .unwrap_or("?");
-                            if ui.small_button(format!("→ {name}")).clicked() {
-                                self.move_selected_to(dir);
-                            }
-                        }
+                        ui.strong(root_name);
                     });
                 }
+                ui.separator();
+
+                ScrollArea::vertical().show(ui, |ui| {
+                    // Render tree starting from explorer_root
+                    if let Some(root) = &root {
+                        render_dir_tree(
+                            ui,
+                            root,
+                            current_folder.as_deref(),
+                            sel_n,
+                            0,
+                            &mut navigate_to,
+                            &mut move_to,
+                        );
+                    }
+                });
             });
 
+        if let Some(path) = move_to {
+            self.move_selected_to(&path);
+        }
         if let Some(path) = navigate_to {
             self.open_folder(path);
         }
@@ -824,21 +796,123 @@ impl CullApp {
 
 // ── helpers ────────────────────────────────────────────────────────────────
 
-/// List immediate subdirectories, sorted by name.
-fn list_subdirs(root: &std::path::Path) -> Vec<PathBuf> {
-    let mut dirs: Vec<PathBuf> = std::fs::read_dir(root)
+/// Extensions that indicate macOS bundles / non-navigable directories.
+const BUNDLE_EXTS: &[&str] = &[
+    "app", "photoslibrary", "photolibrary", "cocatalog", "fcpbundle",
+    "lrcat", "lrdata", "bundle", "framework", "plugin", "kext",
+    "band",  // Time Machine
+];
+
+/// Names to always hide.
+const HIDDEN_DIRS: &[&str] = &[
+    "_picks", "node_modules", "__pycache__", ".git", "target",
+    "Photo Booth Library",
+];
+
+fn is_real_dir(entry: &std::fs::DirEntry) -> bool {
+    // Must be a directory
+    if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+        return false;
+    }
+    let name = entry.file_name();
+    let n = name.to_str().unwrap_or("");
+
+    // Hidden (dotfiles)
+    if n.starts_with('.') { return false; }
+
+    // Known non-dir names
+    if HIDDEN_DIRS.contains(&n) { return false; }
+
+    // macOS bundles look like dirs but aren't navigable image folders
+    if let Some(ext) = std::path::Path::new(n).extension().and_then(|e| e.to_str()) {
+        if BUNDLE_EXTS.contains(&ext.to_lowercase().as_str()) {
+            return false;
+        }
+    }
+
+    true
+}
+
+fn sorted_subdirs(dir: &std::path::Path) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = std::fs::read_dir(dir)
         .into_iter()
         .flatten()
         .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
-        .filter(|e| {
-            // Hide hidden dirs and common non-image dirs
-            let name = e.file_name();
-            let n = name.to_str().unwrap_or("");
-            !n.starts_with('.') && n != "_picks" && n != "node_modules"
-        })
+        .filter(|e| is_real_dir(e))
         .map(|e| e.path())
         .collect();
     dirs.sort();
     dirs
+}
+
+/// Render a collapsible directory tree. Recurses up to `max_depth` levels.
+fn render_dir_tree(
+    ui: &mut egui::Ui,
+    dir: &std::path::Path,
+    current: Option<&std::path::Path>,
+    sel_count: usize,
+    depth: usize,
+    navigate_to: &mut Option<PathBuf>,
+    move_to: &mut Option<PathBuf>,
+) {
+    let max_depth = 3;
+    let children = sorted_subdirs(dir);
+
+    for child in &children {
+        let name = child.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("?");
+
+        let is_current = current == Some(child.as_path());
+        let is_ancestor = current.map_or(false, |c| c.starts_with(child));
+        let has_children = depth < max_depth && has_subdirs(child);
+
+        // Auto-expand if this is an ancestor of the current folder
+        let default_open = is_ancestor;
+        let id = ui.make_persistent_id(child);
+
+        if has_children {
+            let header = egui::collapsing_header::CollapsingState::load_with_default_open(
+                ui.ctx(), id, default_open,
+            );
+
+            header.show_header(ui, |ui| {
+                let resp = ui.selectable_label(is_current, name);
+                if resp.clicked() && !is_current {
+                    *navigate_to = Some(child.clone());
+                }
+                // Move-to button (only when images are selected)
+                if !is_current && sel_count > 0 {
+                    if resp.secondary_clicked() ||
+                        (resp.hovered() && ui.input(|i| i.key_pressed(Key::M)))
+                    {
+                        *move_to = Some(child.clone());
+                    }
+                    resp.on_hover_text("Click to browse • Right-click to move selection here");
+                }
+            })
+            .body(|ui| {
+                render_dir_tree(ui, child, current, sel_count, depth + 1, navigate_to, move_to);
+            });
+        } else {
+            let resp = ui.selectable_label(is_current, format!("   {name}"));
+            if resp.clicked() && !is_current {
+                *navigate_to = Some(child.clone());
+            }
+            if !is_current && sel_count > 0 {
+                if resp.secondary_clicked() {
+                    *move_to = Some(child.clone());
+                }
+                resp.on_hover_text("Click to browse • Right-click to move selection here");
+            }
+        }
+    }
+}
+
+/// Quick check if a directory has any navigable subdirectories.
+fn has_subdirs(dir: &std::path::Path) -> bool {
+    std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .any(|e| e.ok().map_or(false, |e| is_real_dir(&e)))
 }
