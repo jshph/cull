@@ -60,6 +60,11 @@ pub struct CullApp {
     res_rx: mpsc::Receiver<LoadResult>,
 
     status: String,
+
+    /// Visible range (indices into the current `visible` array) of filmstrip
+    /// items that were actually in the viewport last frame. Used to restrict
+    /// thumb loading to only what the user can see + a small buffer.
+    filmstrip_vis: (usize, usize),
 }
 
 impl CullApp {
@@ -96,6 +101,7 @@ impl CullApp {
             req_tx,
             res_rx,
             status: "Drop a folder here or click Open".into(),
+            filmstrip_vis: (0, 0),
         };
 
         if let Some(path) = preload {
@@ -235,11 +241,19 @@ impl eframe::App for CullApp {
         if do_export { self.export_picks(); }
 
         // 5. Preloading strategy:
-        //    • Thumbs for ALL visible images (small, fast — fills filmstrip quickly)
-        //    • Full for selected ±4 only (expensive — keep queue tight)
+        //    • Thumbs: only for items visible in the filmstrip viewport ±8 buffer.
+        //      filmstrip_vis is updated by render_filmstrip each frame from actual
+        //      clip rect intersection — so we only load what the user can see.
+        //    • Full: selected ±4 only (expensive — keep queue tight).
         let visible = self.visible_indices();
-        for &idx in &visible {
-            self.request(idx, LoadKind::Thumb);
+        let (fv_start, fv_end) = self.filmstrip_vis;
+        let buf = 8usize;
+        let thumb_start = fv_start.saturating_sub(buf);
+        let thumb_end   = (fv_end + buf).min(visible.len().saturating_sub(1));
+        for i in thumb_start..=thumb_end {
+            if let Some(&idx) = visible.get(i) {
+                self.request(idx, LoadKind::Thumb);
+            }
         }
         if let Some(pos) = visible.iter().position(|&i| i == self.selected) {
             for delta in 0..=4usize {
@@ -311,6 +325,7 @@ impl CullApp {
         }).collect();
 
         let mut clicked: Option<usize> = None;
+        let mut new_vis: (usize, usize) = (usize::MAX, 0); // (first, last) in thumb_data index
 
         egui::TopBottomPanel::bottom("filmstrip")
             .exact_height(104.0)
@@ -320,7 +335,7 @@ impl CullApp {
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
                             ui.add_space(4.0);
-                            for td in &thumb_data {
+                            for (td_pos, td) in thumb_data.iter().enumerate() {
                                 let border_color = match (&td.mark, td.is_selected) {
                                     (Mark::Pick,   _)    => Color32::from_rgb(72, 199, 116),
                                     (Mark::Reject, _)    => Color32::from_rgb(220, 80, 80),
@@ -330,6 +345,12 @@ impl CullApp {
                                 let border_width = if td.is_selected { 2.5 } else { 1.5 };
 
                                 let (response, painter) = ui.allocate_painter(Vec2::splat(88.0), Sense::click());
+
+                                // Track viewport visibility for smart preloading
+                                if response.rect.intersects(ui.clip_rect()) {
+                                    new_vis.0 = new_vis.0.min(td_pos);
+                                    new_vis.1 = new_vis.1.max(td_pos);
+                                }
 
                                 if response.clicked() { clicked = Some(td.idx); }
                                 if td.is_selected { response.scroll_to_me(Some(Align::Center)); }
@@ -366,6 +387,12 @@ impl CullApp {
             });
 
         if let Some(idx) = clicked { self.selected = idx; }
+
+        // Persist viewport range for next-frame preloading.
+        // If nothing was visible (empty folder / filter), keep previous range.
+        if new_vis.0 != usize::MAX {
+            self.filmstrip_vis = new_vis;
+        }
     }
 
     fn render_main(&mut self, ctx: &Context, visible: &[usize]) {
