@@ -49,7 +49,7 @@ pub struct CullApp {
 }
 
 impl CullApp {
-    pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+    pub fn new(_cc: &eframe::CreationContext<'_>, preload: Option<PathBuf>) -> Self {
         let (req_tx, req_rx) = mpsc::channel::<LoadRequest>();
         let (res_tx, res_rx) = mpsc::channel::<LoadResult>();
 
@@ -61,7 +61,7 @@ impl CullApp {
             }
         });
 
-        Self {
+        let mut app = Self {
             folder: None,
             images: Vec::new(),
             selected: 0,
@@ -71,7 +71,13 @@ impl CullApp {
             req_tx,
             res_rx,
             status: "Drop a folder here or click Open".into(),
+        };
+
+        if let Some(path) = preload {
+            app.open_folder(path);
         }
+
+        app
     }
 
     fn open_folder(&mut self, path: PathBuf) {
