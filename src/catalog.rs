@@ -1,6 +1,5 @@
 use std::path::{Path, PathBuf};
 
-/// RAW and JPEG extensions we handle.
 const IMAGE_EXTS: &[&str] = &[
     "cr2", "cr3", "nef", "arw", "orf", "rw2", "dng", "raf", "pef", "srw",
     "jpg", "jpeg",
@@ -18,6 +17,8 @@ pub enum Mark {
 pub struct ImageEntry {
     pub path: PathBuf,
     pub mark: Mark,
+    /// 0 = no rotation, 1 = 90° CCW, 2 = 180°, 3 = 90° CW
+    pub rotation: u8,
 }
 
 impl ImageEntry {
@@ -45,8 +46,8 @@ pub fn load_folder(folder: &Path) -> Vec<ImageEntry> {
 
             let is_image = IMAGE_EXTS.contains(&ext.as_deref().unwrap_or(""));
             if is_image {
-                let mark = crate::xmp::read_mark(&path).unwrap_or_default();
-                Some(ImageEntry { path, mark })
+                let (mark, rotation) = crate::xmp::read_sidecar(&path).unwrap_or_default();
+                Some(ImageEntry { path, mark, rotation })
             } else {
                 None
             }

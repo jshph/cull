@@ -8,27 +8,35 @@ const THUMB_DIM: u32 = 300;
 // ── public API ─────────────────────────────────────────────────────────────
 
 /// Full-resolution preview for the main view.
-pub fn load_preview(path: &Path) -> Result<egui::ColorImage> {
-    decode_jpeg(extract_full_jpeg(path)?, MAX_DIM)
+pub fn load_preview(path: &Path, rotation: u8) -> Result<egui::ColorImage> {
+    decode_jpeg(extract_full_jpeg(path)?, MAX_DIM, rotation)
 }
 
 /// Filmstrip thumbnail. Uses tiny embedded thumbnails from file headers where
 /// possible (format-specific, targeted seeks) so decode is nearly instant.
 /// Falls back to decoding the full preview at small size.
-pub fn load_thumbnail(path: &Path) -> Result<egui::ColorImage> {
+pub fn load_thumbnail(path: &Path, rotation: u8) -> Result<egui::ColorImage> {
     if let Some(tiny) = extract_tiny_jpeg(path) {
-        if let Ok(img) = decode_jpeg(tiny, THUMB_DIM) {
+        if let Ok(img) = decode_jpeg(tiny, THUMB_DIM, rotation) {
             return Ok(img);
         }
     }
-    decode_jpeg(extract_full_jpeg(path)?, THUMB_DIM)
+    decode_jpeg(extract_full_jpeg(path)?, THUMB_DIM, rotation)
 }
 
 // ── shared decode ─────────────────────────────────────────────────────────
 
-fn decode_jpeg(jpeg: Vec<u8>, max_dim: u32) -> Result<egui::ColorImage> {
+fn decode_jpeg(jpeg: Vec<u8>, max_dim: u32, rotation: u8) -> Result<egui::ColorImage> {
     let img = image::load_from_memory(&jpeg)
         .map_err(|e| anyhow!("decode failed: {e}"))?;
+
+    // Apply rotation before downscaling so aspect ratio is correct after rotate
+    let img = match rotation {
+        1 => img.rotate270(), // 90° CCW
+        2 => img.rotate180(),
+        3 => img.rotate90(),  // 90° CW
+        _ => img,
+    };
 
     let img = if img.width() > max_dim || img.height() > max_dim {
         img.thumbnail(max_dim, max_dim)
