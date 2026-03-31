@@ -1025,6 +1025,8 @@ impl CullApp {
                 }
             });
 
+        self.filmstrip_cols = computed_cols;
+
         if let Some((idx, is_shift, is_cmd)) = clicked {
             let vis = self.visible_indices();
             if is_shift {
@@ -1130,13 +1132,38 @@ impl CullApp {
             let available = ui.available_size();
             match tex_info {
                 Some((tex_id, tex_size)) => {
+                    // Thumb-as-preview: upscale to fill space (naturally blurry).
+                    let max_scale = if is_thumb_only { f32::MAX } else { 1.0 };
                     let scale = (available.x / tex_size.x)
                         .min((available.y - 30.0) / tex_size.y)
-                        .min(1.0);
+                        .min(max_scale);
                     let img_size = tex_size * scale;
+
+                    // Fade: thumb shows dimmed; full brightens over 200ms.
+                    let has_full = !is_thumb_only;
+                    let fade = ui.ctx().animate_bool_with_time(
+                        egui::Id::new("preview_fade").with(selected),
+                        has_full,
+                        0.2,
+                    );
+                    let alpha = if is_thumb_only {
+                        180u8
+                    } else {
+                        (180.0 + 75.0 * fade) as u8
+                    };
+                    let tint = Color32::from_white_alpha(alpha);
+
                     ui.centered_and_justified(|ui| {
-                        ui.add(egui::Image::new((tex_id, img_size)).maintain_aspect_ratio(true));
+                        ui.add(
+                            egui::Image::new((tex_id, img_size))
+                                .maintain_aspect_ratio(true)
+                                .tint(tint),
+                        );
                     });
+
+                    if fade > 0.0 && fade < 1.0 {
+                        ui.ctx().request_repaint();
+                    }
                 }
                 None => {
                     ui.centered_and_justified(|ui| {
