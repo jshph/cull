@@ -22,6 +22,8 @@ pub struct ImageEntry {
     pub rotation: u8,
     /// File modification time — cameras set this to capture time.
     pub modified: SystemTime,
+    /// Keywords / tags — stored as dc:subject in XMP.
+    pub tags: Vec<String>,
 }
 
 impl ImageEntry {
@@ -67,11 +69,11 @@ pub fn load_folder(folder: &Path) -> Vec<ImageEntry> {
 
             let is_image = all_exts.contains(&ext.as_deref().unwrap_or(""));
             if is_image {
-                let (mark, rotation) = crate::xmp::read_sidecar(&path).unwrap_or_default();
+                let (mark, rotation, tags) = crate::xmp::read_sidecar(&path).unwrap_or_default();
                 let modified = std::fs::metadata(&path)
                     .and_then(|m| m.modified())
                     .unwrap_or(SystemTime::UNIX_EPOCH);
-                Some(ImageEntry { path, mark, rotation, modified })
+                Some(ImageEntry { path, mark, rotation, modified, tags })
             } else {
                 None
             }

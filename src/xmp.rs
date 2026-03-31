@@ -7,16 +7,22 @@ pub fn sidecar_path(image: &Path) -> PathBuf {
 
 // ── public write API ───────────────────────────────────────────────────────
 
-/// Write mark, preserving existing rotation.
+/// Write mark, preserving existing rotation and tags.
 pub fn write_mark(image: &Path, mark: &Mark) {
-    let (_, rotation) = read_sidecar(image).unwrap_or_default();
-    write_sidecar(image, mark, rotation);
+    let (_, rotation, tags) = read_sidecar(image).unwrap_or_default();
+    write_sidecar(image, mark, rotation, &tags);
 }
 
-/// Write rotation, preserving existing mark.
+/// Write rotation, preserving existing mark and tags.
 pub fn write_rotation(image: &Path, rotation: u8) {
-    let (mark, _) = read_sidecar(image).unwrap_or_default();
-    write_sidecar(image, &mark, rotation);
+    let (mark, _, tags) = read_sidecar(image).unwrap_or_default();
+    write_sidecar(image, &mark, rotation, &tags);
+}
+
+/// Write tags, preserving existing mark and rotation.
+pub fn write_tags(image: &Path, tags: &[String]) {
+    let (mark, rotation, _) = read_sidecar(image).unwrap_or_default();
+    write_sidecar(image, &mark, rotation, tags);
 }
 
 // ── canonical sidecar write ────────────────────────────────────────────────
@@ -38,7 +44,8 @@ pub fn write_rotation(image: &Path, rotation: u8) {
 ///            No mark — untouched image.
 ///
 ///   tiff:Orientation  (1=normal, 3=180°, 6=90°CW, 8=90°CCW)
-pub fn write_sidecar(image: &Path, mark: &Mark, rotation: u8) {
+///   dc:subject        (keywords / tags as rdf:Bag)
+pub fn write_sidecar(image: &Path, mark: &Mark, rotation: u8, tags: &[String]) {
     let (rating, label) = match mark {
         Mark::Pick   => (0i8,  Some("Green")),
         Mark::Reject => (-1i8, Some("Red")),
@@ -63,15 +70,37 @@ pub fn write_sidecar(image: &Path, mark: &Mark, rotation: u8) {
         String::new()
     };
 
+    let subject_block = if tags.is_empty() {
+        String::new()
+    } else {
+        let items: String = tags.iter()
+            .map(|t| format!("            <rdf:li>{}</rdf:li>\n", xml_escape(t)))
+            .collect();
+        format!(
+            "      <dc:subject>\n\
+             \x20        <rdf:Bag>\n\
+             {items}\
+             \x20        </rdf:Bag>\n\
+             \x20     </dc:subject>\n"
+        )
+    };
+
+    // Include dc namespace only when we have tags
+    let dc_ns = if tags.is_empty() {
+        ""
+    } else {
+        "\n                xmlns:dc=\"http://purl.org/dc/elements/1.1/\""
+    };
+
     let xmp = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
          <x:xmpmeta xmlns:x=\"adobe:ns:meta/\" x:xmptk=\"cull\">\n\
            <rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">\n\
              <rdf:Description rdf:about=\"\"\n\
                  xmlns:xmp=\"http://ns.adobe.com/xap/1.0/\"\n\
-                 xmlns:tiff=\"http://ns.adobe.com/tiff/1.0/\">\n\
+                 xmlns:tiff=\"http://ns.adobe.com/tiff/1.0/\"{dc_ns}>\n\
                <xmp:Rating>{rating}</xmp:Rating>\n\
-         {label_line}{orient_line}    </rdf:Description>\n\
+         {label_line}{orient_line}{subject_block}    </rdf:Description>\n\
            </rdf:RDF>\n\
          </x:xmpmeta>\n"
     );
@@ -79,15 +108,20 @@ pub fn write_sidecar(image: &Path, mark: &Mark, rotation: u8) {
     let _ = std::fs::write(sidecar_path(image), xmp);
 }
 
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+}
+
 // ── read ───────────────────────────────────────────────────────────────────
 
-/// Read (mark, rotation) from XMP sidecar. Returns None if no sidecar exists.
+/// Read (mark, rotation, tags) from XMP sidecar. Returns None if no sidecar exists.
 ///
 /// Recognizes both cull's format and Lightroom-written sidecars:
 ///   Label "Green" → Pick
 ///   Label "Red"   → Reject
 ///   Rating -1     → Reject (LR native reject flag)
-pub fn read_sidecar(image: &Path) -> Option<(Mark, u8)> {
+///   dc:subject    → tags/keywords
+pub fn read_sidecar(image: &Path) -> Option<(Mark, u8, Vec<String>)> {
     let content = std::fs::read_to_string(sidecar_path(image)).ok()?;
 
     let label = extract_tag(&content, "xmp:Label").unwrap_or_default();
@@ -113,7 +147,44 @@ pub fn read_sidecar(image: &Path) -> Option<(Mark, u8)> {
         _ => 0, // normal
     };
 
-    Some((mark, rotation))
+    let tags = extract_rdf_bag(&content, "dc:subject");
+
+    Some((mark, rotation, tags))
+}
+
+/// Extract all <rdf:li> values from within a parent tag's <rdf:Bag>.
+fn extract_rdf_bag(xml: &str, tag: &str) -> Vec<String> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let start = match xml.find(&open) {
+        Some(pos) => pos + open.len(),
+        None => return Vec::new(),
+    };
+    let end = match xml[start..].find(&close) {
+        Some(pos) => start + pos,
+        None => return Vec::new(),
+    };
+    let block = &xml[start..end];
+
+    let mut items = Vec::new();
+    let mut cursor = 0;
+    while let Some(li_start) = block[cursor..].find("<rdf:li>") {
+        let val_start = cursor + li_start + "<rdf:li>".len();
+        if let Some(li_end) = block[val_start..].find("</rdf:li>") {
+            let val = block[val_start..val_start + li_end].trim();
+            if !val.is_empty() {
+                items.push(xml_unescape(val));
+            }
+            cursor = val_start + li_end + "</rdf:li>".len();
+        } else {
+            break;
+        }
+    }
+    items
+}
+
+fn xml_unescape(s: &str) -> String {
+    s.replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
 }
 
 fn extract_tag(xml: &str, tag: &str) -> Option<String> {

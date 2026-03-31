@@ -29,6 +29,7 @@ pub struct SavedState {
     pub filmstrip_height: f32,
     pub window_width: f32,
     pub window_height: f32,
+    pub thumb_size: f32,
 }
 
 impl SavedState {
@@ -40,19 +41,21 @@ impl SavedState {
                     filmstrip_height: lines.next()?.parse().ok()?,
                     window_width: lines.next()?.parse().ok()?,
                     window_height: lines.next()?.parse().ok()?,
+                    thumb_size: lines.next().and_then(|l| l.parse().ok()).unwrap_or(88.0),
                 })
             })
             .unwrap_or(Self {
                 filmstrip_height: 108.0,
                 window_width: 1400.0,
                 window_height: 900.0,
+                thumb_size: 88.0,
             })
     }
 
-    fn save(filmstrip_height: f32, window_width: f32, window_height: f32) {
+    fn save(filmstrip_height: f32, window_width: f32, window_height: f32, thumb_size: f32) {
         let _ = std::fs::write(
             state_path(),
-            format!("{filmstrip_height}\n{window_width}\n{window_height}\n"),
+            format!("{filmstrip_height}\n{window_width}\n{window_height}\n{thumb_size}\n"),
         );
     }
 }
@@ -180,6 +183,14 @@ pub struct CullApp {
     /// Active EXIF filters (empty = no filter)
     camera_filter: String,
     lens_filter: String,
+
+    /// Filmstrip thumbnail size in pixels (adjustable via toolbar slider)
+    thumb_size: f32,
+
+    /// Detected editors: (display_name, app_path)
+    editors: Vec<(String, String)>,
+    /// Index into `editors` for the preferred editor (0 = first found)
+    preferred_editor: usize,
 }
 
 impl CullApp {
@@ -265,6 +276,9 @@ impl CullApp {
             lenses_found: Vec::new(),
             camera_filter: String::new(),
             lens_filter: String::new(),
+            thumb_size: saved.thumb_size,
+            editors: detect_editors(),
+            preferred_editor: 0,
         };
 
         if let Some(path) = preload {
@@ -548,6 +562,71 @@ impl CullApp {
         }
         self.anchor = idx;
     }
+
+    // ── editor integration ────────────────────────────────────────────────
+
+    /// Send files to an external editor (Lightroom Classic, Capture One, etc.)
+    /// Uses macOS `open -a` to trigger the editor's import dialog.
+    ///
+    /// Priority:
+    ///   1. Multi-select active (>1) → send those specific files
+    ///   2. Has picks → send all picked files
+    ///   3. Neither → send the whole folder (LR opens import dialog, C1 browses)
+    fn send_to_editor(&mut self) {
+        let (paths, description) = if self.selected_set.len() > 1 {
+            let p: Vec<PathBuf> = self.selected_set.iter()
+                .filter_map(|&i| self.images.get(i).map(|img| img.path.clone()))
+                .collect();
+            let n = p.len();
+            (p, format!("{n} selected"))
+        } else {
+            let p: Vec<PathBuf> = self.images.iter()
+                .filter(|i| i.mark == Mark::Pick)
+                .map(|i| i.path.clone())
+                .collect();
+            if p.is_empty() {
+                // No picks, no multi-select — send the folder
+                if let Some(folder) = &self.folder {
+                    (vec![folder.clone()], "folder".into())
+                } else {
+                    self.status = "No folder open".into();
+                    return;
+                }
+            } else {
+                let n = p.len();
+                (p, format!("{n} picks"))
+            }
+        };
+
+        if self.editors.is_empty() {
+            self.status = "No editor found (Lightroom Classic / Capture One)".into();
+            return;
+        }
+        let idx = self.preferred_editor.min(self.editors.len() - 1);
+        let (ref editor_name, ref editor_path) = self.editors[idx];
+
+        let mut cmd = std::process::Command::new("open");
+        cmd.arg("-a").arg(editor_path);
+
+        if paths.len() > 500 {
+            if let Some(folder) = &self.folder {
+                cmd.arg(folder);
+            }
+        } else {
+            for p in &paths {
+                cmd.arg(p);
+            }
+        }
+
+        match cmd.spawn() {
+            Ok(_) => {
+                self.status = format!("Sent {description} to {editor_name}");
+            }
+            Err(e) => {
+                self.status = format!("Failed to open {editor_name}: {e}");
+            }
+        }
+    }
 }
 
 // ── eframe::App ────────────────────────────────────────────────────────────
@@ -610,7 +689,7 @@ impl eframe::App for CullApp {
             if delta.abs() > 0.5 {
                 let max_fs = (current_h - MIN_PREVIEW).max(FILMSTRIP_MIN);
                 self.filmstrip_height = (self.filmstrip_height + delta).clamp(FILMSTRIP_MIN, max_fs);
-                SavedState::save(self.filmstrip_height, current_w, current_h);
+                SavedState::save(self.filmstrip_height, current_w, current_h, self.thumb_size);
             }
         }
         self.prev_frame_height = current_h;
@@ -633,7 +712,8 @@ impl eframe::App for CullApp {
 
         // 3. Keyboard
         let (nav_right, nav_left, nav_down, nav_up,
-             do_pick, do_reject, do_unmark, do_export,
+             do_pick, do_reject, do_unmark,
+             do_send_to_editor, do_export_picks,
              rotate_ccw, rotate_cw, toggle_explorer, shift, cmd) = ctx.input(|i| (
             i.key_pressed(Key::ArrowRight),
             i.key_pressed(Key::ArrowLeft),
@@ -642,7 +722,10 @@ impl eframe::App for CullApp {
             i.key_pressed(Key::P) || i.key_pressed(Key::Space),
             i.key_pressed(Key::X),
             i.key_pressed(Key::U),
-            i.key_pressed(Key::E) && i.modifiers.command,
+            // Cmd+E = send to editor (like Photo Mechanic)
+            i.key_pressed(Key::E) && i.modifiers.command && !i.modifiers.shift,
+            // Cmd+Shift+E = export picks to _picks/ folder
+            i.key_pressed(Key::E) && i.modifiers.command && i.modifiers.shift,
             i.key_pressed(Key::R) && !i.modifiers.shift,
             i.key_pressed(Key::R) && i.modifiers.shift,
             i.key_pressed(Key::B) && i.modifiers.command,
@@ -696,7 +779,8 @@ impl eframe::App for CullApp {
             if rotate_ccw { self.rotate(1); }
             if rotate_cw  { self.rotate(-1); }
         }
-        if do_export { self.export_picks(); }
+        if do_send_to_editor { self.send_to_editor(); }
+        if do_export_picks   { self.export_picks(); }
 
         // 5. Rebuild load queue + evict distant textures
         self.rebuild_load_queue();
@@ -885,12 +969,60 @@ impl CullApp {
                 ui.label(&self.status);
 
                 ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-                    if ui.add_enabled(picks > 0, egui::Button::new(format!("Export {picks}"))).clicked() {
+                    // Send to editor — dropdown picks which app, button sends (Cmd+E)
+                    {
+                        let editors = self.editors.clone();
+                        if !editors.is_empty() {
+                            let send_count = if sel_n > 1 { sel_n } else { picks };
+                            let pref = self.preferred_editor.min(editors.len() - 1);
+                            let current_name = editors[pref].0.clone();
+
+                            if editors.len() > 1 {
+                                egui::ComboBox::from_id_salt("editor_picker")
+                                    .selected_text(&current_name)
+                                    .width(130.0)
+                                    .show_ui(ui, |ui| {
+                                        for (i, (name, _)) in editors.iter().enumerate() {
+                                            ui.selectable_value(&mut self.preferred_editor, i, name);
+                                        }
+                                    });
+                            }
+
+                            let label = if send_count > 0 {
+                                format!("{current_name} {send_count}")
+                            } else {
+                                format!("{current_name} (dir)")
+                            };
+                            if ui.button(&label)
+                                .on_hover_text("Send to editor (Cmd+E)")
+                                .clicked()
+                            {
+                                self.send_to_editor();
+                            }
+                        }
+                    }
+                    // Export to _picks/ (Cmd+Shift+E)
+                    if ui.add_enabled(picks > 0, egui::Button::new(format!("Export {picks}")))
+                        .on_hover_text("Copy picks to _picks/ folder (Cmd+Shift+E)")
+                        .clicked()
+                    {
                         self.export_picks();
                     }
                     if !visible.is_empty() {
                         let pos = visible.iter().position(|&i| i == self.selected).map(|p| p + 1).unwrap_or(1);
                         ui.label(format!("{pos} / {}", visible.len()));
+                    }
+
+                    // Thumbnail size slider
+                    ui.separator();
+                    let prev = self.thumb_size;
+                    ui.spacing_mut().slider_width = 80.0;
+                    ui.add(egui::Slider::new(&mut self.thumb_size, 48.0..=256.0)
+                        .show_value(false)
+                        .text("⊞"));
+                    if self.thumb_size != prev {
+                        let screen = ui.ctx().screen_rect();
+                        SavedState::save(self.filmstrip_height, screen.width(), screen.height(), self.thumb_size);
                     }
                 });
             });
@@ -909,6 +1041,7 @@ impl CullApp {
         let drag_active = self.drag_active;
         let pointer_pos = ctx.input(|i| i.pointer.hover_pos());
         let mut navigate_to: Option<PathBuf> = None;
+        let mut select_to: Option<PathBuf> = None;
         let mut move_to: Option<PathBuf> = None;
         let mut drag_hover: Option<PathBuf> = None;
 
@@ -945,6 +1078,7 @@ impl CullApp {
                             sel_n,
                             0,
                             &mut navigate_to,
+                            &mut select_to,
                             &mut move_to,
                             drag_active,
                             pointer_pos,
@@ -959,6 +1093,13 @@ impl CullApp {
         if let Some(path) = move_to {
             self.move_selected_to(&path);
         }
+        // Single click: load folder images but keep explorer root
+        if let Some(path) = select_to {
+            let saved_root = self.explorer_root.clone();
+            self.open_folder(path);
+            self.explorer_root = saved_root;
+        }
+        // Double click: full navigation (changes explorer root)
         if let Some(path) = navigate_to {
             self.open_folder(path);
         }
@@ -991,16 +1132,15 @@ impl CullApp {
                 let avail_h = ui.available_height();
                 let avail_w = ui.available_width();
 
-                // Fixed thumb size — always 88px. The panel height determines
-                // how many rows fit, which determines the layout mode.
-                let item_px: f32 = 88.0;
+                let item_px: f32 = self.thumb_size;
                 let cell = item_px + 6.0; // item + padding
                 let n_rows = ((avail_h / cell).floor() as usize).max(1);
                 let multi_row = n_rows >= 2;
 
                 if multi_row {
                     // ── GRID MODE: vertical scroll, items wrap left→right top→bottom ──
-                    let cols = ((avail_w - 8.0) / cell).floor().max(1.0) as usize;
+                    // Account for 4px left pad; zero item_spacing in rows so only explicit spacing applies
+                    let cols = ((avail_w - 4.0) / cell).floor().max(1.0) as usize;
                     computed_cols = cols;
 
                     ScrollArea::vertical()
@@ -1009,6 +1149,7 @@ impl CullApp {
                             let total_rows = (td.len() + cols - 1) / cols;
                             for row in 0..total_rows {
                                 ui.horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 0.0;
                                     ui.add_space(4.0);
                                     for col in 0..cols {
                                         let item_i = row * cols + col;
@@ -1035,6 +1176,7 @@ impl CullApp {
                         .id_salt("filmstrip_scroll")
                         .show(ui, |ui| {
                             ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 0.0;
                                 ui.add_space(4.0);
                                 for t in &td {
                                     let response = self.paint_thumb(ui, t, item_px, needs_scroll);
@@ -1077,7 +1219,7 @@ impl CullApp {
                 }
                 if response.drag_stopped() {
                     let screen = ui.ctx().screen_rect();
-                    SavedState::save(self.filmstrip_height, screen.width(), screen.height());
+                    SavedState::save(self.filmstrip_height, screen.width(), screen.height(), self.thumb_size);
                 }
                 if response.hovered() {
                     ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
@@ -1402,6 +1544,7 @@ fn sorted_subdirs(dir: &std::path::Path) -> Vec<PathBuf> {
 }
 
 /// Render a collapsible directory tree. Recurses up to `max_depth` levels.
+/// Single-click selects a folder (loads images, keeps root). Double-click navigates (changes root).
 fn render_dir_tree(
     ui: &mut egui::Ui,
     dir: &std::path::Path,
@@ -1409,6 +1552,7 @@ fn render_dir_tree(
     sel_count: usize,
     depth: usize,
     navigate_to: &mut Option<PathBuf>,
+    select_to: &mut Option<PathBuf>,
     move_to: &mut Option<PathBuf>,
     drag_active: bool,
     pointer_pos: Option<egui::Pos2>,
@@ -1437,8 +1581,12 @@ fn render_dir_tree(
 
             header.show_header(ui, |ui| {
                 let resp = ui.selectable_label(is_current, name);
-                if resp.clicked() && !is_current {
-                    *navigate_to = Some(child.clone());
+                if !is_current {
+                    if resp.double_clicked() {
+                        *navigate_to = Some(child.clone());
+                    } else if resp.clicked() {
+                        *select_to = Some(child.clone());
+                    }
                 }
                 // Drop target highlight during drag
                 if drag_active && !is_current {
@@ -1459,16 +1607,20 @@ fn render_dir_tree(
                     {
                         *move_to = Some(child.clone());
                     }
-                    resp.on_hover_text("Click to browse • Right-click to move selection here");
+                    resp.on_hover_text("Click to view • Double-click to set as root • Right-click to move selection here");
                 }
             })
             .body(|ui| {
-                render_dir_tree(ui, child, current, sel_count, depth + 1, navigate_to, move_to, drag_active, pointer_pos, drag_hover);
+                render_dir_tree(ui, child, current, sel_count, depth + 1, navigate_to, select_to, move_to, drag_active, pointer_pos, drag_hover);
             });
         } else {
             let resp = ui.selectable_label(is_current, format!("   {name}"));
-            if resp.clicked() && !is_current {
-                *navigate_to = Some(child.clone());
+            if !is_current {
+                if resp.double_clicked() {
+                    *navigate_to = Some(child.clone());
+                } else if resp.clicked() {
+                    *select_to = Some(child.clone());
+                }
             }
             // Drop target highlight during drag
             if drag_active && !is_current {
@@ -1486,7 +1638,7 @@ fn render_dir_tree(
                 if resp.secondary_clicked() {
                     *move_to = Some(child.clone());
                 }
-                resp.on_hover_text("Click to browse • Right-click to move selection here");
+                resp.on_hover_text("Click to view • Double-click to set as root • Right-click to move selection here");
             }
         }
     }
@@ -1498,4 +1650,55 @@ fn has_subdirs(dir: &std::path::Path) -> bool {
         .into_iter()
         .flatten()
         .any(|e| e.ok().map_or(false, |e| is_real_dir(&e)))
+}
+
+/// Detect all installed photo editors. Returns (display_name, app_path) pairs.
+fn detect_editors() -> Vec<(String, String)> {
+    let mut found = Vec::new();
+
+    let candidates: &[(&str, &[&str])] = &[
+        ("Lightroom Classic", &[
+            "/Applications/Adobe Lightroom Classic/Adobe Lightroom Classic.app",
+            "/Applications/Adobe Lightroom Classic.app",
+        ]),
+        ("Capture One", &[
+            "/Applications/Capture One.app",
+            "/Applications/Capture One 23.app",
+            "/Applications/Capture One 22.app",
+        ]),
+        ("Darktable", &[
+            "/Applications/darktable.app",
+        ]),
+    ];
+
+    for (name, paths) in candidates {
+        for path in *paths {
+            if std::path::Path::new(path).exists() {
+                found.push((name.to_string(), path.to_string()));
+                break;
+            }
+        }
+    }
+
+    // mdfind fallbacks
+    if !found.iter().any(|(n, _)| n == "Lightroom Classic") {
+        if let Some(p) = mdfind("com.adobe.LightroomClassicCC7") {
+            found.push(("Lightroom Classic".into(), p));
+        }
+    }
+    if !found.iter().any(|(n, _)| n == "Capture One") {
+        if let Some(p) = mdfind("com.captureone.captureone*") {
+            found.push(("Capture One".into(), p));
+        }
+    }
+
+    found
+}
+
+fn mdfind(bundle_id: &str) -> Option<String> {
+    let output = std::process::Command::new("mdfind")
+        .args([format!("kMDItemCFBundleIdentifier == '{bundle_id}'")])
+        .output().ok()?;
+    let s = String::from_utf8_lossy(&output.stdout);
+    s.lines().next().filter(|l| !l.is_empty()).map(|l| l.to_string())
 }
