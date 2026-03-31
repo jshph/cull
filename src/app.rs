@@ -11,6 +11,51 @@ use crate::catalog::{load_folder, ImageEntry, Mark};
 use crate::preview::{load_preview, load_thumbnail};
 use crate::xmp;
 
+// ── layout constants ───────────────────────────────────────────────────────
+
+const FILMSTRIP_MIN: f32 = 60.0;
+const PREVIEW_MAX: f32 = 800.0;
+const MIN_PREVIEW: f32 = 200.0;
+
+// ── persistence ────────────────────────────────────────────────────────────
+
+fn state_path() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    PathBuf::from(home).join(".cull-state")
+}
+
+pub struct SavedState {
+    pub filmstrip_height: f32,
+    pub window_width: f32,
+    pub window_height: f32,
+}
+
+impl SavedState {
+    pub fn load() -> Self {
+        std::fs::read_to_string(state_path()).ok()
+            .and_then(|text| {
+                let mut lines = text.lines();
+                Some(Self {
+                    filmstrip_height: lines.next()?.parse().ok()?,
+                    window_width: lines.next()?.parse().ok()?,
+                    window_height: lines.next()?.parse().ok()?,
+                })
+            })
+            .unwrap_or(Self {
+                filmstrip_height: 108.0,
+                window_width: 1400.0,
+                window_height: 900.0,
+            })
+    }
+
+    fn save(filmstrip_height: f32, window_width: f32, window_height: f32) {
+        let _ = std::fs::write(
+            state_path(),
+            format!("{filmstrip_height}\n{window_width}\n{window_height}\n"),
+        );
+    }
+}
+
 // ── background loading ─────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -59,6 +104,9 @@ pub struct CullApp {
 
     /// Filmstrip panel height — managed manually to avoid egui's sticky resize.
     filmstrip_height: f32,
+    /// Previous frame's window height — used to make filmstrip absorb window
+    /// resize deltas so the preview stays stable.
+    prev_frame_height: f32,
 
     /// Explorer sidebar visibility
     show_explorer: bool,
@@ -84,6 +132,8 @@ impl CullApp {
             }
         });
 
+        let saved = SavedState::load();
+
         let mut app = Self {
             folder: None,
             images: Vec::new(),
@@ -99,7 +149,8 @@ impl CullApp {
             status: "Drop a folder here or click Open".into(),
             needs_scroll: true,
             filmstrip_vis: (0, 0),
-            filmstrip_height: 108.0,
+            filmstrip_height: saved.filmstrip_height,
+            prev_frame_height: 0.0,
             show_explorer: false,
             explorer_root: None,
         };
@@ -258,6 +309,29 @@ impl eframe::App for CullApp {
                 ctx.request_repaint();
             }
         }
+
+        // 1b. Window resize → filmstrip absorbs the delta so preview stays stable
+        let screen = ctx.screen_rect();
+        let current_h = screen.height();
+        let current_w = screen.width();
+        if self.prev_frame_height > 0.0 {
+            let delta = current_h - self.prev_frame_height;
+            if delta.abs() > 0.5 {
+                let max_fs = (current_h - MIN_PREVIEW).max(FILMSTRIP_MIN);
+                self.filmstrip_height = (self.filmstrip_height + delta).clamp(FILMSTRIP_MIN, max_fs);
+                SavedState::save(self.filmstrip_height, current_w, current_h);
+            }
+        }
+        self.prev_frame_height = current_h;
+
+        // Cap preview: if preview exceeds PREVIEW_MAX, give excess to filmstrip
+        let overhead = 46.0; // approx toolbar + divider
+        let preview_h = current_h - overhead - self.filmstrip_height;
+        if preview_h > PREVIEW_MAX {
+            self.filmstrip_height += preview_h - PREVIEW_MAX;
+        }
+        let max_fs = (current_h - MIN_PREVIEW).max(FILMSTRIP_MIN);
+        self.filmstrip_height = self.filmstrip_height.clamp(FILMSTRIP_MIN, max_fs);
 
         // 2. Drag-and-drop
         let dropped = ctx.input(|i| i.raw.dropped_files.first().and_then(|f| f.path.clone()));
@@ -508,8 +582,13 @@ impl CullApp {
                     Stroke::new(20.0, Color32::from_gray(70)),
                 );
                 if response.dragged() {
+                    let max_fs = (ui.ctx().screen_rect().height() - MIN_PREVIEW).max(FILMSTRIP_MIN);
                     self.filmstrip_height = (filmstrip_h - response.drag_delta().y)
-                        .clamp(60.0, 600.0);
+                        .clamp(FILMSTRIP_MIN, max_fs);
+                }
+                if response.drag_stopped() {
+                    let screen = ui.ctx().screen_rect();
+                    SavedState::save(self.filmstrip_height, screen.width(), screen.height());
                 }
                 if response.hovered() {
                     ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);

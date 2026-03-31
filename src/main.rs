@@ -58,10 +58,11 @@ fn main() {
 }
 
 fn run_gui(preload: Option<PathBuf>) {
+    let saved = app::SavedState::load();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Cull")
-            .with_inner_size([1400.0, 900.0])
+            .with_inner_size([saved.window_width, saved.window_height])
             .with_min_inner_size([800.0, 600.0])
             .with_drag_and_drop(true),
         ..Default::default()
