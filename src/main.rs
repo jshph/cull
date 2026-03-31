@@ -4,6 +4,7 @@
 mod app;
 mod catalog;
 mod cli;
+mod exif;
 mod preview;
 mod xmp;
 

@@ -8,6 +8,7 @@ use egui::{
 };
 
 use crate::catalog::{load_folder, ImageEntry, Mark};
+use crate::exif::ExifInfo;
 use crate::preview::{load_preview, load_thumbnail};
 use crate::xmp;
 
@@ -160,6 +161,18 @@ pub struct CullApp {
     show_explorer: bool,
     /// Root directory for the explorer tree (parent of current folder)
     explorer_root: Option<PathBuf>,
+
+    /// EXIF info per image index — populated in background after folder open.
+    exif_data: HashMap<usize, ExifInfo>,
+    exif_rx: mpsc::Receiver<(usize, ExifInfo)>,
+    exif_tx_template: mpsc::Sender<(usize, ExifInfo)>,
+    /// Unique camera bodies found (for filter dropdown)
+    cameras_found: Vec<String>,
+    /// Unique lenses found
+    lenses_found: Vec<String>,
+    /// Active EXIF filters (empty = no filter)
+    camera_filter: String,
+    lens_filter: String,
 }
 
 impl CullApp {
@@ -212,6 +225,7 @@ impl CullApp {
         }
 
         let saved = SavedState::load();
+        let (exif_tx_init, exif_rx_init) = mpsc::channel::<(usize, ExifInfo)>();
 
         let mut app = Self {
             folder: None,
@@ -234,6 +248,13 @@ impl CullApp {
             prev_frame_height: 0.0,
             show_explorer: false,
             explorer_root: None,
+            exif_data: HashMap::new(),
+            exif_rx: exif_rx_init,
+            exif_tx_template: exif_tx_init,
+            cameras_found: Vec::new(),
+            lenses_found: Vec::new(),
+            camera_filter: String::new(),
+            lens_filter: String::new(),
         };
 
         if let Some(path) = preload {
@@ -266,9 +287,31 @@ impl CullApp {
         let explorer_root = path.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| path.clone());
         self.explorer_root = Some(explorer_root);
         self.folder = Some(path);
+
+        // Background EXIF scan — reads ~8KB per file, populates camera/lens/ISO
+        self.exif_data.clear();
+        self.cameras_found.clear();
+        self.lenses_found.clear();
+        self.camera_filter.clear();
+        self.lens_filter.clear();
+        let (tx, rx) = mpsc::channel();
+        self.exif_rx = rx;
+        self.exif_tx_template = tx.clone();
+        let paths: Vec<(usize, PathBuf)> = self.images.iter().enumerate()
+            .map(|(i, img)| (i, img.path.clone()))
+            .collect();
+        std::thread::spawn(move || {
+            for (idx, path) in paths {
+                if let Some(info) = crate::exif::read_exif(&path) {
+                    if tx.send((idx, info)).is_err() { break; }
+                }
+            }
+        });
     }
 
     fn visible_indices(&self) -> Vec<usize> {
+        let cam = &self.camera_filter;
+        let lens = &self.lens_filter;
         let mut indices: Vec<usize> = self.images
             .iter()
             .enumerate()
@@ -281,6 +324,19 @@ impl CullApp {
                 FileFilter::AllTypes => true,
                 FileFilter::RawOnly => img.is_raw(),
                 FileFilter::JpegOnly => img.is_jpeg(),
+            })
+            .filter(|(i, _)| {
+                if !cam.is_empty() {
+                    if let Some(exif) = self.exif_data.get(i) {
+                        if exif.camera != *cam { return false; }
+                    } else { return false; }
+                }
+                if !lens.is_empty() {
+                    if let Some(exif) = self.exif_data.get(i) {
+                        if exif.lens != *lens { return false; }
+                    } else { return false; }
+                }
+                true
             })
             .map(|(i, _)| i)
             .collect();
@@ -508,6 +564,33 @@ impl eframe::App for CullApp {
             }
         }
 
+        // 1a. Drain background EXIF results
+        {
+            let mut changed = false;
+            while let Ok((idx, info)) = self.exif_rx.try_recv() {
+                self.exif_data.insert(idx, info);
+                changed = true;
+            }
+            if changed {
+                // Rebuild unique camera/lens lists
+                let mut cameras: Vec<String> = self.exif_data.values()
+                    .filter(|e| !e.camera.is_empty())
+                    .map(|e| e.camera.clone())
+                    .collect::<HashSet<_>>().into_iter().collect();
+                cameras.sort();
+                self.cameras_found = cameras;
+
+                let mut lenses: Vec<String> = self.exif_data.values()
+                    .filter(|e| !e.lens.is_empty())
+                    .map(|e| e.lens.clone())
+                    .collect::<HashSet<_>>().into_iter().collect();
+                lenses.sort();
+                self.lenses_found = lenses;
+
+                ctx.request_repaint();
+            }
+        }
+
         // 1b. Window resize → filmstrip absorbs the delta so preview stays stable
         let screen = ctx.screen_rect();
         let current_h = screen.height();
@@ -640,7 +723,7 @@ impl CullApp {
                     let label = folder.file_name()
                         .and_then(|n| n.to_str())
                         .unwrap_or("…");
-                    if ui.button(format!("📁 {label}")).on_hover_text(folder.display().to_string()).clicked() {
+                    if ui.button(format!(">{label}")).on_hover_text(folder.display().to_string()).clicked() {
                         if let Some(p) = rfd::FileDialog::new()
                             .set_directory(folder)
                             .pick_folder()
@@ -648,7 +731,7 @@ impl CullApp {
                             self.open_folder(p);
                         }
                     }
-                } else if ui.button("📁 Open Folder").clicked() {
+                } else if ui.button(">Open Folder").clicked() {
                     if let Some(p) = rfd::FileDialog::new().pick_folder() {
                         self.open_folder(p);
                     }
@@ -669,15 +752,53 @@ impl CullApp {
                     ui.selectable_value(&mut self.file_filter, FileFilter::JpegOnly, format!("JPEG  {n_jpeg}"));
                 }
 
+                // Camera filter — only shown when multiple bodies detected
+                if self.cameras_found.len() > 1 {
+                    ui.separator();
+                    let cam_label = if self.camera_filter.is_empty() {
+                        "Camera: All".to_string()
+                    } else {
+                        self.camera_filter.clone()
+                    };
+                    egui::ComboBox::from_id_salt("cam_filter")
+                        .selected_text(&cam_label)
+                        .width(120.0)
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut self.camera_filter, String::new(), "All cameras");
+                            for c in &self.cameras_found.clone() {
+                                ui.selectable_value(&mut self.camera_filter, c.clone(), c);
+                            }
+                        });
+                }
+
+                // Lens filter
+                if self.lenses_found.len() > 1 {
+                    ui.separator();
+                    let lens_label = if self.lens_filter.is_empty() {
+                        "Lens: All".to_string()
+                    } else {
+                        self.lens_filter.clone()
+                    };
+                    egui::ComboBox::from_id_salt("lens_filter")
+                        .selected_text(&lens_label)
+                        .width(140.0)
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut self.lens_filter, String::new(), "All lenses");
+                            for l in &self.lenses_found.clone() {
+                                ui.selectable_value(&mut self.lens_filter, l.clone(), l);
+                            }
+                        });
+                }
+
                 // Sort order — cycles through options on click
                 ui.separator();
                 let sort_label = match self.sort_order {
-                    SortOrder::Name     => "Name ↑",
-                    SortOrder::DateAsc  => "Date ↑",
-                    SortOrder::DateDesc => "Date ↓",
+                    SortOrder::Name     => "Name A-Z",
+                    SortOrder::DateAsc  => "Date old",
+                    SortOrder::DateDesc => "Date new",
                 };
                 if ui.button(sort_label)
-                    .on_hover_text("Click to cycle: Name → Date → Date (reversed)")
+                    .on_hover_text("Click to cycle: Name / Date / Date (reversed)")
                     .clicked()
                 {
                     self.sort_order = match self.sort_order {
@@ -734,7 +855,7 @@ impl CullApp {
                     ui.horizontal(|ui| {
                         // Up button
                         if let Some(parent) = root.parent() {
-                            if ui.small_button("⬆").on_hover_text("Go up one level").clicked() {
+                            if ui.small_button("..").on_hover_text("Go up one level").clicked() {
                                 navigate_to = Some(parent.to_path_buf());
                             }
                         }
@@ -1001,10 +1122,25 @@ impl CullApp {
             let painter    = ui.painter();
             let panel_rect = ui.max_rect();
 
-            let rot_label = match rotation { 1 => " ↺90", 2 => " ↻180", 3 => " ↻90", _ => "" };
+            let rot_label = match rotation { 1 => " -90", 2 => " 180", 3 => " +90", _ => "" };
+            let exif_label = self.exif_data.get(&selected).map(|e| {
+                let mut parts = Vec::new();
+                if !e.camera.is_empty() { parts.push(e.camera.as_str()); }
+                if !e.lens.is_empty() { parts.push(e.lens.as_str()); }
+                let mut extra = String::new();
+                if e.focal_mm > 0.0 { extra.push_str(&format!("{}mm", e.focal_mm as u32)); }
+                if e.iso > 0 {
+                    if !extra.is_empty() { extra.push_str("  "); }
+                    extra.push_str(&format!("ISO {}", e.iso));
+                }
+                if !extra.is_empty() { parts.push(&extra); }
+                // return owned string from parts joined
+                parts.join("  ")
+            }).unwrap_or_default();
+            // We need the exif_label to live long enough
+            let exif_suffix = if exif_label.is_empty() { String::new() } else { format!("   {exif_label}") };
             let info = format!(
-                "{}{}   {vis_pos}/{vis_total}   \
-                 [P] pick  [X] reject  [U] unmark  [R] rotate  [←→] nav  [⌘B] files  [⌘E] export",
+                "{}{}   {vis_pos}/{vis_total}{exif_suffix}",
                 filename.as_deref().unwrap_or(""), rot_label,
             );
             painter.rect_filled(
