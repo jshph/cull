@@ -339,6 +339,17 @@ impl eframe::App for CullApp {
     }
 }
 
+// ── thumbnail data for filmstrip ───────────────────────────────────────────
+
+struct TD {
+    idx: usize,
+    vis_pos: usize,
+    is_cursor: bool,
+    in_set: bool,
+    mark: Mark,
+    tex_id: Option<egui::TextureId>,
+}
+
 // ── rendering ──────────────────────────────────────────────────────────────
 
 impl CullApp {
@@ -491,14 +502,6 @@ impl CullApp {
     }
 
     fn render_filmstrip(&mut self, ctx: &Context, visible: &[usize], shift: bool, cmd: bool) {
-        struct TD {
-            idx: usize,
-            vis_pos: usize,
-            is_cursor: bool,
-            in_set: bool,
-            mark: Mark,
-            tex_id: Option<egui::TextureId>,
-        }
 
         let td: Vec<TD> = visible.iter().enumerate().map(|(vis_pos, &idx)| TD {
             idx, vis_pos,
@@ -545,82 +548,62 @@ impl CullApp {
             .exact_height(self.filmstrip_height)
             .show(ctx, |ui| {
                 let avail_h = ui.available_height();
-                let item_px = (avail_h - 12.0).clamp(50.0, 400.0);
+                let avail_w = ui.available_width();
 
-                ScrollArea::horizontal()
-                    .id_salt("filmstrip_scroll")
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.add_space(4.0);
-                            for t in &td {
-                                let (response, painter) = ui.allocate_painter(
-                                    Vec2::new(item_px + 4.0, item_px + 4.0),
-                                    Sense::click(),
-                                );
+                // Fixed thumb size — always 88px. The panel height determines
+                // how many rows fit, which determines the layout mode.
+                let item_px: f32 = 88.0;
+                let cell = item_px + 6.0; // item + padding
+                let n_rows = ((avail_h / cell).floor() as usize).max(1);
+                let multi_row = n_rows >= 2;
 
-                                if response.rect.intersects(ui.clip_rect()) {
-                                    new_vis.0 = new_vis.0.min(t.vis_pos);
-                                    new_vis.1 = new_vis.1.max(t.vis_pos);
-                                }
+                if multi_row {
+                    // ── GRID MODE: vertical scroll, items wrap left→right top→bottom ──
+                    let cols = ((avail_w - 8.0) / cell).floor().max(1.0) as usize;
 
-                                if response.clicked() {
-                                    clicked = Some((t.idx, shift, cmd));
-                                }
-                                if t.is_cursor && needs_scroll {
-                                    response.scroll_to_me(Some(Align::Center));
-                                }
-
-                                let bg = if t.in_set && !t.is_cursor {
-                                    Color32::from_rgba_premultiplied(30, 55, 110, 255)
-                                } else {
-                                    Color32::from_gray(20)
-                                };
-                                let rect = response.rect.shrink(2.0);
-                                painter.rect_filled(rect, 2.0, bg);
-
-                                if let Some(tex_id) = t.tex_id {
-                                    painter.image(
-                                        tex_id, rect,
-                                        Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                                        Color32::WHITE,
-                                    );
-                                }
-
-                                let (bc, bw) = if t.is_cursor {
-                                    (Color32::WHITE, 2.5)
-                                } else if t.in_set {
-                                    (Color32::from_rgb(80, 140, 230), 2.0)
-                                } else {
-                                    match &t.mark {
-                                        Mark::Pick   => (Color32::from_rgb(72, 199, 116), 1.5),
-                                        Mark::Reject => (Color32::from_rgb(220, 80, 80), 1.5),
-                                        Mark::None   => (Color32::from_gray(50), 1.0),
+                    ScrollArea::vertical()
+                        .id_salt("filmstrip_scroll")
+                        .show(ui, |ui| {
+                            let total_rows = (td.len() + cols - 1) / cols;
+                            for row in 0..total_rows {
+                                ui.horizontal(|ui| {
+                                    ui.add_space(4.0);
+                                    for col in 0..cols {
+                                        let item_i = row * cols + col;
+                                        if let Some(t) = td.get(item_i) {
+                                            let response = self.paint_thumb(ui, t, item_px, needs_scroll);
+                                            if response.rect.intersects(ui.clip_rect()) {
+                                                new_vis.0 = new_vis.0.min(t.vis_pos);
+                                                new_vis.1 = new_vis.1.max(t.vis_pos);
+                                            }
+                                            if response.clicked() {
+                                                clicked = Some((t.idx, shift, cmd));
+                                            }
+                                        }
                                     }
-                                };
-                                painter.rect_stroke(
-                                    response.rect.shrink(1.0), 2.0,
-                                    Stroke::new(bw, bc),
-                                );
-
-                                // Mark badge — scale with item
-                                let badge_sz = (item_px * 0.16).clamp(12.0, 20.0);
-                                if let Some((label, color)) = match t.mark {
-                                    Mark::Pick   => Some(("P", Color32::from_rgb(72, 199, 116))),
-                                    Mark::Reject => Some(("R", Color32::from_rgb(220, 80, 80))),
-                                    Mark::None   => None,
-                                } {
-                                    let b = Rect::from_min_size(rect.min, Vec2::splat(badge_sz));
-                                    painter.rect_filled(b, 0.0, Color32::from_black_alpha(160));
-                                    painter.text(
-                                        b.center(), egui::Align2::CENTER_CENTER, label,
-                                        FontId::proportional(badge_sz * 0.65), color,
-                                    );
-                                }
-
-                                ui.add_space(2.0);
+                                });
                             }
                         });
-                    });
+                } else {
+                    // ── STRIP MODE: horizontal scroll, single row ──
+                    ScrollArea::horizontal()
+                        .id_salt("filmstrip_scroll")
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.add_space(4.0);
+                                for t in &td {
+                                    let response = self.paint_thumb(ui, t, item_px, needs_scroll);
+                                    if response.rect.intersects(ui.clip_rect()) {
+                                        new_vis.0 = new_vis.0.min(t.vis_pos);
+                                        new_vis.1 = new_vis.1.max(t.vis_pos);
+                                    }
+                                    if response.clicked() {
+                                        clicked = Some((t.idx, shift, cmd));
+                                    }
+                                }
+                            });
+                        });
+                }
             });
 
         if let Some((idx, is_shift, is_cmd)) = clicked {
@@ -637,6 +620,63 @@ impl CullApp {
 
         if new_vis.0 != usize::MAX { self.filmstrip_vis = new_vis; }
         self.needs_scroll = false;
+    }
+
+    /// Paint a single filmstrip thumbnail. Returns the click response.
+    fn paint_thumb(&self, ui: &mut egui::Ui, t: &TD, item_px: f32, needs_scroll: bool) -> egui::Response {
+        let (response, painter) = ui.allocate_painter(
+            Vec2::splat(item_px + 4.0), Sense::click(),
+        );
+
+        if t.is_cursor && needs_scroll {
+            response.scroll_to_me(Some(Align::Center));
+        }
+
+        let bg = if t.in_set && !t.is_cursor {
+            Color32::from_rgba_premultiplied(30, 55, 110, 255)
+        } else {
+            Color32::from_gray(20)
+        };
+        let rect = response.rect.shrink(2.0);
+        painter.rect_filled(rect, 2.0, bg);
+
+        if let Some(tex_id) = t.tex_id {
+            painter.image(
+                tex_id, rect,
+                Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                Color32::WHITE,
+            );
+        }
+
+        let (bc, bw) = if t.is_cursor {
+            (Color32::WHITE, 2.5)
+        } else if t.in_set {
+            (Color32::from_rgb(80, 140, 230), 2.0)
+        } else {
+            match &t.mark {
+                Mark::Pick   => (Color32::from_rgb(72, 199, 116), 1.5),
+                Mark::Reject => (Color32::from_rgb(220, 80, 80), 1.5),
+                Mark::None   => (Color32::from_gray(50), 1.0),
+            }
+        };
+        painter.rect_stroke(response.rect.shrink(1.0), 2.0, Stroke::new(bw, bc));
+
+        let badge_sz = (item_px * 0.16).clamp(12.0, 20.0);
+        if let Some((label, color)) = match t.mark {
+            Mark::Pick   => Some(("P", Color32::from_rgb(72, 199, 116))),
+            Mark::Reject => Some(("R", Color32::from_rgb(220, 80, 80))),
+            Mark::None   => None,
+        } {
+            let b = Rect::from_min_size(rect.min, Vec2::splat(badge_sz));
+            painter.rect_filled(b, 0.0, Color32::from_black_alpha(160));
+            painter.text(
+                b.center(), egui::Align2::CENTER_CENTER, label,
+                FontId::proportional(badge_sz * 0.65), color,
+            );
+        }
+
+        ui.add_space(2.0);
+        response
     }
 
     fn render_main(&mut self, ctx: &Context, visible: &[usize]) {
