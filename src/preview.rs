@@ -1,20 +1,30 @@
 use std::path::Path;
 use anyhow::{anyhow, Result};
 
-/// Max dimension for display texture. Keeps memory sane for 50MP cameras.
+/// Max dimension for the full display texture. Keeps memory sane for 50MP cameras.
 const MAX_DIM: u32 = 2400;
 
-/// Load a displayable ColorImage from any supported image or RAW file.
-/// For RAW files, extracts the embedded JPEG preview (no RAW decoding).
-pub fn load_preview(path: &Path) -> Result<egui::ColorImage> {
-    let jpeg_bytes = extract_jpeg(path)?;
+/// Max dimension for filmstrip thumbnails.
+/// 300px decoded image → 240 KB RGBA upload vs 15 MB for the full preview.
+const THUMB_DIM: u32 = 300;
 
+/// Full-resolution preview for the main view (2400px max).
+pub fn load_preview(path: &Path) -> Result<egui::ColorImage> {
+    decode_jpeg(extract_jpeg(path)?, MAX_DIM)
+}
+
+/// Tiny thumbnail for the filmstrip (300px max).
+/// Same JPEG extract + decode path — win is the much smaller GPU upload.
+pub fn load_thumbnail(path: &Path) -> Result<egui::ColorImage> {
+    decode_jpeg(extract_jpeg(path)?, THUMB_DIM)
+}
+
+fn decode_jpeg(jpeg_bytes: Vec<u8>, max_dim: u32) -> Result<egui::ColorImage> {
     let img = image::load_from_memory(&jpeg_bytes)
         .map_err(|e| anyhow!("decode failed: {e}"))?;
 
-    // Downscale large previews — 24MP embedded JPEGs are ~6000x4000 = 96MB RGBA
-    let img = if img.width() > MAX_DIM || img.height() > MAX_DIM {
-        img.thumbnail(MAX_DIM, MAX_DIM)
+    let img = if img.width() > max_dim || img.height() > max_dim {
+        img.thumbnail(max_dim, max_dim)
     } else {
         img
     };
@@ -22,7 +32,6 @@ pub fn load_preview(path: &Path) -> Result<egui::ColorImage> {
     let rgba = img.into_rgba8();
     let size = [rgba.width() as usize, rgba.height() as usize];
     let pixels = rgba.into_raw();
-
     Ok(egui::ColorImage::from_rgba_unmultiplied(size, &pixels))
 }
 
