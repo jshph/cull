@@ -112,6 +112,19 @@ impl LoadPool {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Filter { All, Picks, Unrated }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum FileFilter { AllTypes, RawOnly, JpegOnly }
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum SortOrder {
+    /// Filename ascending (default — same as filesystem order)
+    Name,
+    /// File modification time ascending (oldest first = chronological)
+    DateAsc,
+    /// File modification time descending (newest first = cull backwards)
+    DateDesc,
+}
+
 // ── app state ──────────────────────────────────────────────────────────────
 
 pub struct CullApp {
@@ -123,6 +136,8 @@ pub struct CullApp {
     anchor: usize,
 
     filter: Filter,
+    file_filter: FileFilter,
+    sort_order: SortOrder,
 
     thumb_textures: HashMap<usize, TextureHandle>,
     full_textures: HashMap<usize, TextureHandle>,
@@ -205,6 +220,8 @@ impl CullApp {
             selected_set: HashSet::new(),
             anchor: 0,
             filter: Filter::All,
+            file_filter: FileFilter::AllTypes,
+            sort_order: SortOrder::Name,
             thumb_textures: HashMap::new(),
             full_textures: HashMap::new(),
             load_pool: pool,
@@ -252,7 +269,7 @@ impl CullApp {
     }
 
     fn visible_indices(&self) -> Vec<usize> {
-        self.images
+        let mut indices: Vec<usize> = self.images
             .iter()
             .enumerate()
             .filter(|(_, img)| match self.filter {
@@ -260,8 +277,25 @@ impl CullApp {
                 Filter::Picks   => img.mark == Mark::Pick,
                 Filter::Unrated => img.mark == Mark::None,
             })
+            .filter(|(_, img)| match self.file_filter {
+                FileFilter::AllTypes => true,
+                FileFilter::RawOnly => img.is_raw(),
+                FileFilter::JpegOnly => img.is_jpeg(),
+            })
             .map(|(i, _)| i)
-            .collect()
+            .collect();
+
+        match self.sort_order {
+            SortOrder::Name => {} // already sorted by filename from load_folder
+            SortOrder::DateAsc => {
+                indices.sort_by(|&a, &b| self.images[a].modified.cmp(&self.images[b].modified));
+            }
+            SortOrder::DateDesc => {
+                indices.sort_by(|&a, &b| self.images[b].modified.cmp(&self.images[a].modified));
+            }
+        }
+
+        indices
     }
 
     /// Rebuild the shared load queue from scratch based on current state.
@@ -583,8 +617,13 @@ impl CullApp {
         let total   = self.images.len();
         let picks   = self.images.iter().filter(|i| i.mark == Mark::Pick).count();
         let unrated = self.images.iter().filter(|i| i.mark == Mark::None).count();
+        let n_raw   = self.images.iter().filter(|i| i.is_raw()).count();
+        let n_jpeg  = self.images.iter().filter(|i| i.is_jpeg()).count();
         let sel_n   = self.selected_set.len();
         let visible = self.visible_indices();
+
+        // Only show file type filter when both types are present
+        let has_mixed_types = n_raw > 0 && n_jpeg > 0;
 
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -596,7 +635,7 @@ impl CullApp {
 
                 ui.separator();
 
-                // Folder breadcrumb — shows current folder name, click to change
+                // Folder breadcrumb
                 if let Some(folder) = &self.folder.clone() {
                     let label = folder.file_name()
                         .and_then(|n| n.to_str())
@@ -617,9 +656,36 @@ impl CullApp {
 
                 ui.separator();
 
+                // Mark filter
                 ui.selectable_value(&mut self.filter, Filter::All,     format!("All  {total}"));
                 ui.selectable_value(&mut self.filter, Filter::Picks,   format!("Picks  {picks}"));
                 ui.selectable_value(&mut self.filter, Filter::Unrated, format!("Unrated  {unrated}"));
+
+                // File type filter — only shown when folder has both RAW and JPEG
+                if has_mixed_types {
+                    ui.separator();
+                    ui.selectable_value(&mut self.file_filter, FileFilter::AllTypes, "All types");
+                    ui.selectable_value(&mut self.file_filter, FileFilter::RawOnly,  format!("RAW  {n_raw}"));
+                    ui.selectable_value(&mut self.file_filter, FileFilter::JpegOnly, format!("JPEG  {n_jpeg}"));
+                }
+
+                // Sort order — cycles through options on click
+                ui.separator();
+                let sort_label = match self.sort_order {
+                    SortOrder::Name     => "Name ↑",
+                    SortOrder::DateAsc  => "Date ↑",
+                    SortOrder::DateDesc => "Date ↓",
+                };
+                if ui.button(sort_label)
+                    .on_hover_text("Click to cycle: Name → Date → Date (reversed)")
+                    .clicked()
+                {
+                    self.sort_order = match self.sort_order {
+                        SortOrder::Name     => SortOrder::DateAsc,
+                        SortOrder::DateAsc  => SortOrder::DateDesc,
+                        SortOrder::DateDesc => SortOrder::Name,
+                    };
+                }
 
                 if sel_n > 1 {
                     ui.separator();

@@ -1,9 +1,10 @@
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
-const IMAGE_EXTS: &[&str] = &[
+const RAW_EXTS: &[&str] = &[
     "cr2", "cr3", "nef", "arw", "orf", "rw2", "dng", "raf", "pef", "srw",
-    "jpg", "jpeg",
 ];
+const JPEG_EXTS: &[&str] = &["jpg", "jpeg"];
 
 #[derive(Debug, Clone, PartialEq, Default)]
 pub enum Mark {
@@ -19,6 +20,8 @@ pub struct ImageEntry {
     pub mark: Mark,
     /// 0 = no rotation, 1 = 90° CCW, 2 = 180°, 3 = 90° CW
     pub rotation: u8,
+    /// File modification time — cameras set this to capture time.
+    pub modified: SystemTime,
 }
 
 impl ImageEntry {
@@ -28,9 +31,27 @@ impl ImageEntry {
             .and_then(|n| n.to_str())
             .unwrap_or("unknown")
     }
+
+    fn ext_lower(&self) -> String {
+        self.path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_lowercase())
+            .unwrap_or_default()
+    }
+
+    pub fn is_raw(&self) -> bool {
+        RAW_EXTS.contains(&self.ext_lower().as_str())
+    }
+
+    pub fn is_jpeg(&self) -> bool {
+        JPEG_EXTS.contains(&self.ext_lower().as_str())
+    }
 }
 
 pub fn load_folder(folder: &Path) -> Vec<ImageEntry> {
+    let all_exts: Vec<&str> = RAW_EXTS.iter().chain(JPEG_EXTS.iter()).cloned().collect();
+
     walkdir::WalkDir::new(folder)
         .max_depth(1)
         .sort_by_file_name()
@@ -44,10 +65,13 @@ pub fn load_folder(folder: &Path) -> Vec<ImageEntry> {
                 .and_then(|e| e.to_str())
                 .map(|e| e.to_lowercase());
 
-            let is_image = IMAGE_EXTS.contains(&ext.as_deref().unwrap_or(""));
+            let is_image = all_exts.contains(&ext.as_deref().unwrap_or(""));
             if is_image {
                 let (mark, rotation) = crate::xmp::read_sidecar(&path).unwrap_or_default();
-                Some(ImageEntry { path, mark, rotation })
+                let modified = std::fs::metadata(&path)
+                    .and_then(|m| m.modified())
+                    .unwrap_or(SystemTime::UNIX_EPOCH);
+                Some(ImageEntry { path, mark, rotation, modified })
             } else {
                 None
             }
