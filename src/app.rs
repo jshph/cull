@@ -164,6 +164,11 @@ pub struct CullApp {
     /// Root directory for the explorer tree (parent of current folder)
     explorer_root: Option<PathBuf>,
 
+    /// Drag-and-drop: true while dragging thumbnails toward a folder
+    drag_active: bool,
+    /// Folder currently hovered during drag (drop target)
+    drag_hover_folder: Option<PathBuf>,
+
     /// EXIF info per image index — populated in background after folder open.
     exif_data: HashMap<usize, ExifInfo>,
     exif_rx: mpsc::Receiver<(usize, ExifInfo)>,
@@ -251,6 +256,8 @@ impl CullApp {
             prev_frame_height: 0.0,
             show_explorer: false,
             explorer_root: None,
+            drag_active: false,
+            drag_hover_folder: None,
             exif_data: HashMap::new(),
             exif_rx: exif_rx_init,
             exif_tx_template: exif_tx_init,
@@ -703,6 +710,40 @@ impl eframe::App for CullApp {
         let visible = self.visible_indices();
         self.render_filmstrip(ctx, &visible, shift, cmd);
         self.render_main(ctx, &visible);
+
+        // 7. Handle drag-to-folder
+        if self.drag_active {
+            // Floating indicator near cursor
+            if let Some(pos) = ctx.input(|i| i.pointer.hover_pos()) {
+                let n = self.selected_set.len();
+                let label = if self.drag_hover_folder.is_some() {
+                    let folder_name = self.drag_hover_folder.as_ref().unwrap()
+                        .file_name().and_then(|n| n.to_str()).unwrap_or("folder");
+                    format!("Move {n} → {folder_name}")
+                } else {
+                    format!("Move {n} image{}", if n == 1 { "" } else { "s" })
+                };
+                egui::Area::new(egui::Id::new("drag_indicator"))
+                    .fixed_pos(pos + egui::vec2(14.0, 10.0))
+                    .order(egui::Order::Tooltip)
+                    .interactable(false)
+                    .show(ctx, |ui| {
+                        egui::Frame::popup(ui.style()).show(ui, |ui| {
+                            ui.label(label);
+                        });
+                    });
+            }
+            ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
+
+            // Finalize on mouse release
+            if ctx.input(|i| !i.pointer.primary_down()) {
+                self.drag_active = false;
+                if let Some(folder) = self.drag_hover_folder.take() {
+                    self.move_selected_to(&folder);
+                }
+            }
+            ctx.request_repaint();
+        }
     }
 }
 
@@ -857,13 +898,19 @@ impl CullApp {
     }
 
     fn render_explorer(&mut self, ctx: &Context) {
-        if !self.show_explorer { return; }
+        if !self.show_explorer {
+            self.drag_hover_folder = None;
+            return;
+        }
 
         let current_folder = self.folder.clone();
         let root = self.explorer_root.clone();
         let sel_n = self.selected_set.len();
+        let drag_active = self.drag_active;
+        let pointer_pos = ctx.input(|i| i.pointer.hover_pos());
         let mut navigate_to: Option<PathBuf> = None;
         let mut move_to: Option<PathBuf> = None;
+        let mut drag_hover: Option<PathBuf> = None;
 
         egui::SidePanel::left("explorer")
             .resizable(true)
@@ -899,10 +946,15 @@ impl CullApp {
                             0,
                             &mut navigate_to,
                             &mut move_to,
+                            drag_active,
+                            pointer_pos,
+                            &mut drag_hover,
                         );
                     }
                 });
             });
+
+        self.drag_hover_folder = drag_hover;
 
         if let Some(path) = move_to {
             self.move_selected_to(&path);
@@ -926,6 +978,7 @@ impl CullApp {
 
         let needs_scroll = self.needs_scroll;
         let mut clicked: Option<(usize, bool, bool)> = None;
+        let mut drag_started_on: Option<usize> = None;
         let mut new_vis: (usize, usize) = (usize::MAX, 0);
         let mut computed_cols: usize = 1;
 
@@ -968,6 +1021,9 @@ impl CullApp {
                                             if response.clicked() {
                                                 clicked = Some((t.idx, shift, cmd));
                                             }
+                                            if response.drag_started() {
+                                                drag_started_on = Some(t.idx);
+                                            }
                                         }
                                     }
                                 });
@@ -988,6 +1044,9 @@ impl CullApp {
                                     }
                                     if response.clicked() {
                                         clicked = Some((t.idx, shift, cmd));
+                                    }
+                                    if response.drag_started() {
+                                        drag_started_on = Some(t.idx);
                                     }
                                 }
                             });
@@ -1039,6 +1098,14 @@ impl CullApp {
             self.needs_scroll = false;
         }
 
+        // Start drag-to-folder if user drags a thumbnail
+        if let Some(idx) = drag_started_on {
+            if !self.selected_set.contains(&idx) {
+                self.nav_to(idx); // select unselected thumb before dragging
+            }
+            self.drag_active = true;
+        }
+
         if new_vis.0 != usize::MAX { self.filmstrip_vis = new_vis; }
         self.needs_scroll = false;
     }
@@ -1046,7 +1113,7 @@ impl CullApp {
     /// Paint a single filmstrip thumbnail. Returns the click response.
     fn paint_thumb(&self, ui: &mut egui::Ui, t: &TD, item_px: f32, needs_scroll: bool) -> egui::Response {
         let (response, painter) = ui.allocate_painter(
-            Vec2::splat(item_px + 4.0), Sense::click(),
+            Vec2::splat(item_px + 4.0), Sense::click_and_drag(),
         );
 
         if t.is_cursor && needs_scroll {
@@ -1343,6 +1410,9 @@ fn render_dir_tree(
     depth: usize,
     navigate_to: &mut Option<PathBuf>,
     move_to: &mut Option<PathBuf>,
+    drag_active: bool,
+    pointer_pos: Option<egui::Pos2>,
+    drag_hover: &mut Option<PathBuf>,
 ) {
     let max_depth = 3;
     let children = sorted_subdirs(dir);
@@ -1370,8 +1440,20 @@ fn render_dir_tree(
                 if resp.clicked() && !is_current {
                     *navigate_to = Some(child.clone());
                 }
+                // Drop target highlight during drag
+                if drag_active && !is_current {
+                    if let Some(pos) = pointer_pos {
+                        if resp.rect.contains(pos) {
+                            ui.painter().rect_filled(
+                                resp.rect, 2.0,
+                                Color32::from_rgba_premultiplied(60, 120, 220, 80),
+                            );
+                            *drag_hover = Some(child.clone());
+                        }
+                    }
+                }
                 // Move-to button (only when images are selected)
-                if !is_current && sel_count > 0 {
+                if !is_current && sel_count > 0 && !drag_active {
                     if resp.secondary_clicked() ||
                         (resp.hovered() && ui.input(|i| i.key_pressed(Key::M)))
                     {
@@ -1381,14 +1463,26 @@ fn render_dir_tree(
                 }
             })
             .body(|ui| {
-                render_dir_tree(ui, child, current, sel_count, depth + 1, navigate_to, move_to);
+                render_dir_tree(ui, child, current, sel_count, depth + 1, navigate_to, move_to, drag_active, pointer_pos, drag_hover);
             });
         } else {
             let resp = ui.selectable_label(is_current, format!("   {name}"));
             if resp.clicked() && !is_current {
                 *navigate_to = Some(child.clone());
             }
-            if !is_current && sel_count > 0 {
+            // Drop target highlight during drag
+            if drag_active && !is_current {
+                if let Some(pos) = pointer_pos {
+                    if resp.rect.contains(pos) {
+                        ui.painter().rect_filled(
+                            resp.rect, 2.0,
+                            Color32::from_rgba_premultiplied(60, 120, 220, 80),
+                        );
+                        *drag_hover = Some(child.clone());
+                    }
+                }
+            }
+            if !is_current && sel_count > 0 && !drag_active {
                 if resp.secondary_clicked() {
                     *move_to = Some(child.clone());
                 }
