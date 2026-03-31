@@ -16,7 +16,6 @@ walkdir = "2"
 anyhow = "1"
 rfd = "0.14"
 clap = { version = "4", features = ["derive"] }
-rayon = "1"
 
 [profile.release]
 opt-level = 3

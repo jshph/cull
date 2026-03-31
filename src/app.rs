@@ -1,6 +1,6 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc, Condvar, Mutex};
 
 use egui::{
     Align, Color32, Context, FontId, Key, Rect, ScrollArea, Sense, Stroke, TextureHandle,
@@ -66,12 +66,45 @@ struct LoadRequest {
     path: PathBuf,
     kind: LoadKind,
     rotation: u8,
+    generation: u64,
 }
 
 struct LoadResult {
     index: usize,
     kind: LoadKind,
+    rotation: u8,
+    generation: u64,
     image: Result<egui::ColorImage, String>,
+}
+
+// ── load pool (shared priority queue) ─────────────────────────────────────
+//
+// Pull-based: UI rebuilds the pending queue every frame in priority order.
+// Workers pop from the front (highest priority). Stale requests from prior
+// viewport positions are simply gone on the next rebuild — no FIFO backlog.
+
+struct LoadPool {
+    inner: Mutex<LoadPoolInner>,
+    wake: Condvar,
+}
+
+struct LoadPoolInner {
+    pending: VecDeque<LoadRequest>,
+    in_progress: HashSet<(usize, LoadKind)>,
+    generation: u64,
+}
+
+impl LoadPool {
+    fn new() -> Self {
+        Self {
+            inner: Mutex::new(LoadPoolInner {
+                pending: VecDeque::new(),
+                in_progress: HashSet::new(),
+                generation: 0,
+            }),
+            wake: Condvar::new(),
+        }
+    }
 }
 
 // ── filter ─────────────────────────────────────────────────────────────────
@@ -93,10 +126,10 @@ pub struct CullApp {
 
     thumb_textures: HashMap<usize, TextureHandle>,
     full_textures: HashMap<usize, TextureHandle>,
-    loading: HashSet<(usize, LoadKind)>,
 
-    req_tx: mpsc::SyncSender<LoadRequest>,
+    load_pool: Arc<LoadPool>,
     res_rx: mpsc::Receiver<LoadResult>,
+    generation: u64,
 
     status: String,
     needs_scroll: bool,
@@ -116,21 +149,52 @@ pub struct CullApp {
 
 impl CullApp {
     pub fn new(_cc: &eframe::CreationContext<'_>, preload: Option<PathBuf>) -> Self {
-        let (req_tx, req_rx) = mpsc::sync_channel::<LoadRequest>(64);
+        let pool = Arc::new(LoadPool::new());
         let (res_tx, res_rx) = mpsc::channel::<LoadResult>();
 
-        std::thread::spawn(move || {
-            for req in req_rx {
-                let res_tx = res_tx.clone();
-                rayon::spawn(move || {
+        // Spawn persistent worker threads that pull from the shared priority queue.
+        let n_workers = std::thread::available_parallelism()
+            .map(|n| n.get().clamp(2, 8))
+            .unwrap_or(4);
+        for _ in 0..n_workers {
+            let pool = pool.clone();
+            let res_tx = res_tx.clone();
+            std::thread::spawn(move || {
+                loop {
+                    let req = {
+                        let mut q = pool.inner.lock().unwrap();
+                        loop {
+                            // Skip stale-generation items still in the queue
+                            while q.pending.front()
+                                .map_or(false, |r| r.generation != q.generation)
+                            {
+                                q.pending.pop_front();
+                            }
+                            if let Some(req) = q.pending.pop_front() {
+                                q.in_progress.insert((req.index, req.kind));
+                                break req;
+                            }
+                            q = pool.wake.wait(q).unwrap();
+                        }
+                    };
                     let image = match req.kind {
                         LoadKind::Thumb => load_thumbnail(&req.path, req.rotation),
                         LoadKind::Full  => load_preview(&req.path, req.rotation),
                     }.map_err(|e| e.to_string());
-                    let _ = res_tx.send(LoadResult { index: req.index, kind: req.kind, image });
-                });
-            }
-        });
+                    {
+                        let mut q = pool.inner.lock().unwrap();
+                        q.in_progress.remove(&(req.index, req.kind));
+                    }
+                    let _ = res_tx.send(LoadResult {
+                        index: req.index,
+                        kind: req.kind,
+                        rotation: req.rotation,
+                        generation: req.generation,
+                        image,
+                    });
+                }
+            });
+        }
 
         let saved = SavedState::load();
 
@@ -143,9 +207,9 @@ impl CullApp {
             filter: Filter::All,
             thumb_textures: HashMap::new(),
             full_textures: HashMap::new(),
-            loading: HashSet::new(),
-            req_tx,
+            load_pool: pool,
             res_rx,
+            generation: 0,
             status: "Drop a folder here or click Open".into(),
             needs_scroll: true,
             filmstrip_vis: (0, 0),
@@ -171,7 +235,13 @@ impl CullApp {
         if count > 0 { self.selected_set.insert(0); }
         self.thumb_textures.clear();
         self.full_textures.clear();
-        self.loading.clear();
+        self.generation += 1;
+        {
+            let mut q = self.load_pool.inner.lock().unwrap();
+            q.pending.clear();
+            q.in_progress.clear();
+            q.generation = self.generation;
+        }
         self.status = format!("{count} images");
         self.needs_scroll = true;
 
@@ -194,21 +264,112 @@ impl CullApp {
             .collect()
     }
 
-    fn request(&mut self, idx: usize, kind: LoadKind) {
-        let key = (idx, kind);
-        let have = match kind {
-            LoadKind::Thumb => self.thumb_textures.contains_key(&idx),
-            LoadKind::Full  => self.full_textures.contains_key(&idx),
-        };
-        if idx < self.images.len() && !have && !self.loading.contains(&key) {
-            self.loading.insert(key);
-            let _ = self.req_tx.try_send(LoadRequest {
-                index: idx,
-                path: self.images[idx].path.clone(),
-                kind,
-                rotation: self.images[idx].rotation,
-            });
+    /// Rebuild the shared load queue from scratch based on current state.
+    /// Called every frame — clears stale requests and re-enqueues by priority.
+    fn rebuild_load_queue(&self) {
+        let visible = self.visible_indices();
+        if visible.is_empty() || self.images.is_empty() { return; }
+
+        let (fv_s, fv_e) = self.filmstrip_vis;
+        let gen = self.generation;
+        let n = self.images.len();
+
+        // Build priority-ordered wanted list (deduped)
+        let mut seen = HashSet::new();
+        let mut wanted: Vec<(usize, LoadKind)> = Vec::new();
+        {
+            let mut enqueue = |idx: usize, kind: LoadKind| {
+                if idx < n && seen.insert((idx, kind)) {
+                    wanted.push((idx, kind));
+                }
+            };
+
+            // P1: Full preview for selected image (user is looking at this NOW)
+            enqueue(self.selected, LoadKind::Full);
+
+            // P2: Thumbnails for visible viewport (filmstrip must never be black;
+            //     thumbs decode in ~1ms so they clear fast even behind one full)
+            for i in fv_s..=fv_e.min(visible.len().saturating_sub(1)) {
+                if let Some(&idx) = visible.get(i) { enqueue(idx, LoadKind::Thumb); }
+            }
+
+            // P3: Full previews for selected ± 4 (arrow-key anticipation)
+            if let Some(pos) = visible.iter().position(|&i| i == self.selected) {
+                for d in 1..=4usize {
+                    if pos + d < visible.len() { enqueue(visible[pos + d], LoadKind::Full); }
+                    if pos >= d                { enqueue(visible[pos - d], LoadKind::Full); }
+                }
+            }
+
+            // P4: Full previews for visible filmstrip items + buffer
+            //     (clicking any visible thumb should show full preview instantly)
+            let preview_buf = 4;
+            let plo = fv_s.saturating_sub(preview_buf);
+            let phi = (fv_e + preview_buf).min(visible.len().saturating_sub(1));
+            for i in plo..=phi {
+                if let Some(&idx) = visible.get(i) { enqueue(idx, LoadKind::Full); }
+            }
+
+            // P5: Thumbnails for wider buffer (scroll anticipation)
+            let thumb_buf = 12;
+            let tlo = fv_s.saturating_sub(thumb_buf);
+            let thi = (fv_e + thumb_buf).min(visible.len().saturating_sub(1));
+            for i in tlo..=thi {
+                if let Some(&idx) = visible.get(i) { enqueue(idx, LoadKind::Thumb); }
+            }
         }
+
+        // Flush to shared queue — replaces all previous pending items
+        let mut q = self.load_pool.inner.lock().unwrap();
+        q.pending.clear();
+        for (idx, kind) in wanted {
+            let has = match kind {
+                LoadKind::Thumb => self.thumb_textures.contains_key(&idx),
+                LoadKind::Full  => self.full_textures.contains_key(&idx),
+            };
+            if !has && !q.in_progress.contains(&(idx, kind)) {
+                q.pending.push_back(LoadRequest {
+                    index: idx,
+                    path: self.images[idx].path.clone(),
+                    kind,
+                    rotation: self.images[idx].rotation,
+                    generation: gen,
+                });
+            }
+        }
+        drop(q);
+        self.load_pool.wake.notify_all();
+    }
+
+    /// Evict full textures far from both viewport and selection to cap memory.
+    fn evict_textures(&mut self) {
+        let visible = self.visible_indices();
+        if visible.is_empty() { return; }
+
+        let (fv_s, fv_e) = self.filmstrip_vis;
+        let margin = 30;
+
+        // Keep around viewport
+        let vp_lo = fv_s.saturating_sub(margin);
+        let vp_hi = (fv_e + margin).min(visible.len().saturating_sub(1));
+
+        // Also keep around selected (might be outside viewport after keyboard nav)
+        let sel_pos = visible.iter().position(|&i| i == self.selected).unwrap_or(0);
+        let sel_lo = sel_pos.saturating_sub(margin);
+        let sel_hi = (sel_pos + margin).min(visible.len().saturating_sub(1));
+
+        let keep: HashSet<usize> = (vp_lo..=vp_hi)
+            .chain(sel_lo..=sel_hi)
+            .filter_map(|i| visible.get(i).copied())
+            .collect();
+        self.full_textures.retain(|idx, _| keep.contains(idx));
+    }
+
+    /// Check if a full preview is queued or being decoded for this image.
+    fn is_load_pending(&self, idx: usize) -> bool {
+        let q = self.load_pool.inner.lock().unwrap();
+        q.in_progress.contains(&(idx, LoadKind::Full))
+            || q.pending.iter().any(|r| r.index == idx && r.kind == LoadKind::Full)
     }
 
     // ── mutations ──────────────────────────────────────────────────────────
@@ -233,12 +394,11 @@ impl CullApp {
             let img = &mut self.images[idx];
             img.rotation = ((img.rotation as i8 + delta).rem_euclid(4)) as u8;
             xmp::write_rotation(&img.path.clone(), img.rotation);
-
             self.full_textures.remove(&idx);
             self.thumb_textures.remove(&idx);
-            self.loading.remove(&(idx, LoadKind::Full));
-            self.loading.remove(&(idx, LoadKind::Thumb));
         }
+        // Queue will be rebuilt next frame; stale in-flight results are
+        // discarded in the drain loop via rotation mismatch check.
     }
 
     fn export_picks(&mut self) {
@@ -294,9 +454,13 @@ impl CullApp {
 
 impl eframe::App for CullApp {
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
-        // 1. Drain loader
+        // 1. Drain loader — discard stale generation / rotation results
         while let Ok(r) = self.res_rx.try_recv() {
-            self.loading.remove(&(r.index, r.kind));
+            if r.generation != self.generation { continue; }
+            // Rotation may have changed while decode was in flight
+            if let Some(img) = self.images.get(r.index) {
+                if img.rotation != r.rotation { continue; }
+            }
             if let Ok(img) = r.image {
                 let tex = ctx.load_texture(
                     format!("img_{}_{}", r.index, r.kind as u8),
@@ -386,19 +550,9 @@ impl eframe::App for CullApp {
         }
         if do_export { self.export_picks(); }
 
-        // 5. Preload
-        let visible = self.visible_indices();
-        let (fv_s, fv_e) = self.filmstrip_vis;
-        let buf = 8;
-        for i in fv_s.saturating_sub(buf)..=(fv_e + buf).min(visible.len().saturating_sub(1)) {
-            if let Some(&idx) = visible.get(i) { self.request(idx, LoadKind::Thumb); }
-        }
-        if let Some(pos) = visible.iter().position(|&i| i == self.selected) {
-            for d in 0..=4usize {
-                if pos + d < visible.len() { self.request(visible[pos + d], LoadKind::Full); }
-                if d > 0 && pos >= d        { self.request(visible[pos - d], LoadKind::Full); }
-            }
-        }
+        // 5. Rebuild load queue + evict distant textures
+        self.rebuild_load_queue();
+        self.evict_textures();
 
         // 6. Render
         //    render_explorer may navigate to a new folder, changing self.images.
@@ -563,38 +717,9 @@ impl CullApp {
         let mut clicked: Option<(usize, bool, bool)> = None;
         let mut new_vis: (usize, usize) = (usize::MAX, 0);
 
-        // Manual resize separator — avoids egui's sticky resizable() behavior.
-        // Paint a thin drag handle above the filmstrip panel.
-        let filmstrip_h = self.filmstrip_height;
-        egui::TopBottomPanel::bottom("filmstrip_resize")
-            .exact_height(6.0)
-            .show(ctx, |ui| {
-                let response = ui.allocate_response(
-                    Vec2::new(ui.available_width(), 6.0),
-                    Sense::drag(),
-                );
-                // Subtle visual handle
-                let rect = response.rect;
-                ui.painter().rect_filled(rect, 0.0, Color32::from_gray(45));
-                ui.painter().line_segment(
-                    [rect.center_top() + egui::vec2(0.0, 2.0),
-                     rect.center_top() + egui::vec2(0.0, 4.0)],
-                    Stroke::new(20.0, Color32::from_gray(70)),
-                );
-                if response.dragged() {
-                    let max_fs = (ui.ctx().screen_rect().height() - MIN_PREVIEW).max(FILMSTRIP_MIN);
-                    self.filmstrip_height = (filmstrip_h - response.drag_delta().y)
-                        .clamp(FILMSTRIP_MIN, max_fs);
-                }
-                if response.drag_stopped() {
-                    let screen = ui.ctx().screen_rect();
-                    SavedState::save(self.filmstrip_height, screen.width(), screen.height());
-                }
-                if response.hovered() {
-                    ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
-                }
-            });
-
+        // Bottom panels stack upward in egui — render filmstrip FIRST so it
+        // occupies the bottom edge, then the resize handle sits ABOVE it
+        // (between the preview and filmstrip, where the user expects it).
         egui::TopBottomPanel::bottom("filmstrip")
             .exact_height(self.filmstrip_height)
             .show(ctx, |ui| {
@@ -654,6 +779,36 @@ impl CullApp {
                                 }
                             });
                         });
+                }
+            });
+
+        // Resize handle — rendered AFTER filmstrip so it stacks above it,
+        // sitting between the preview pane and the filmstrip.
+        egui::TopBottomPanel::bottom("filmstrip_resize")
+            .exact_height(6.0)
+            .show(ctx, |ui| {
+                let response = ui.allocate_response(
+                    Vec2::new(ui.available_width(), 6.0),
+                    Sense::drag(),
+                );
+                let rect = response.rect;
+                ui.painter().rect_filled(rect, 0.0, Color32::from_gray(45));
+                ui.painter().line_segment(
+                    [rect.center_top() + egui::vec2(0.0, 2.0),
+                     rect.center_top() + egui::vec2(0.0, 4.0)],
+                    Stroke::new(20.0, Color32::from_gray(70)),
+                );
+                if response.dragged() {
+                    let max_fs = (ui.ctx().screen_rect().height() - MIN_PREVIEW).max(FILMSTRIP_MIN);
+                    self.filmstrip_height = (self.filmstrip_height - response.drag_delta().y)
+                        .clamp(FILMSTRIP_MIN, max_fs);
+                }
+                if response.drag_stopped() {
+                    let screen = ui.ctx().screen_rect();
+                    SavedState::save(self.filmstrip_height, screen.width(), screen.height());
+                }
+                if response.hovered() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
                 }
             });
 
@@ -744,7 +899,7 @@ impl CullApp {
             .or_else(|| self.thumb_textures.get(&selected))
             .map(|t| (t.id(), t.size_vec2()));
         let is_thumb_only = tex_info.is_some() && !self.full_textures.contains_key(&selected);
-        let is_loading = self.loading.contains(&(selected, LoadKind::Full));
+        let is_loading = self.is_load_pending(selected);
 
         egui::CentralPanel::default().show(ctx, |ui| {
             if is_empty {
@@ -867,7 +1022,7 @@ impl CullApp {
         // Rebuild texture index since indices shifted
         self.thumb_textures.clear();
         self.full_textures.clear();
-        self.loading.clear();
+        // Queue will be rebuilt next frame with correct indices
 
         self.status = format!("Moved {moved} images");
     }
