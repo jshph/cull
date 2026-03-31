@@ -37,12 +37,64 @@ fn extract_jpeg(path: &Path) -> Result<Vec<u8>> {
         return Ok(std::fs::read(path)?);
     }
 
-    // RAW formats (CR2, NEF, ARW, DNG, etc.) all embed a full-resolution JPEG.
-    // Locate it by scanning for JPEG SOI (FF D8 FF) and EOI (FF D9) markers.
-    // We take the largest JPEG found, which is always the full-res preview.
     let data = std::fs::read(path)?;
+
+    // Fuji RAF: proprietary container. The embedded JPEG offset/size are
+    // stored explicitly in the header — byte scanning finds thumbnails, not
+    // the full-res preview. Parse the header directly instead.
+    if data.starts_with(b"FUJIFILMCCD-RAW") {
+        return extract_raf_jpeg(&data)
+            .ok_or_else(|| anyhow!("no JPEG preview found in RAF file {:?}", path));
+    }
+
+    // TIFF-based RAW formats (CR2, NEF, ARW, ORF, DNG, RW2, PEF, SRW…)
+    // all embed a full-resolution JPEG. Scan for the largest one.
     find_largest_jpeg(&data)
         .ok_or_else(|| anyhow!("no embedded JPEG found in {:?}", path))
+}
+
+/// Fuji RAF header layout (all versions):
+///   0x00  16 bytes  magic "FUJIFILMCCD-RAW"
+///   0x10   4 bytes  format version
+///   0x14   8 bytes  camera model ID
+///   0x1C  32 bytes  camera model string
+///   0x54   4 bytes  JPEG preview offset (big-endian u32)
+///   0x58   4 bytes  JPEG preview length (big-endian u32)
+fn extract_raf_jpeg(data: &[u8]) -> Option<Vec<u8>> {
+    // Minimum header size check
+    if data.len() < 100 {
+        return None;
+    }
+
+    // Try the standard offset (0x54 / 84) used by all known Fuji bodies
+    let jpeg = try_raf_at(data, 84);
+    if jpeg.is_some() {
+        return jpeg;
+    }
+
+    // Older RAF variants (some pre-2010 bodies) used 0x44 / 68
+    let jpeg = try_raf_at(data, 68);
+    if jpeg.is_some() {
+        return jpeg;
+    }
+
+    // Last resort: fall back to byte scanner (will at least find a thumbnail)
+    find_largest_jpeg(data)
+}
+
+fn try_raf_at(data: &[u8], off_field: usize) -> Option<Vec<u8>> {
+    let off = u32::from_be_bytes(data[off_field..off_field + 4].try_into().ok()?) as usize;
+    let len = u32::from_be_bytes(data[off_field + 4..off_field + 8].try_into().ok()?) as usize;
+
+    if off == 0 || len == 0 || off + len > data.len() {
+        return None;
+    }
+    // Validate it's actually a JPEG
+    if data[off] != 0xFF || data[off + 1] != 0xD8 {
+        return None;
+    }
+
+    Some(data[off..off + len].to_vec())
 }
 
 fn find_largest_jpeg(data: &[u8]) -> Option<Vec<u8>> {
