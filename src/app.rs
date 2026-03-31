@@ -14,10 +14,7 @@ use crate::xmp;
 // ── background loading ─────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-enum LoadKind {
-    Thumb,
-    Full,
-}
+enum LoadKind { Thumb, Full }
 
 struct LoadRequest {
     index: usize,
@@ -35,11 +32,7 @@ struct LoadResult {
 // ── filter ─────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum Filter {
-    All,
-    Picks,
-    Unrated,
-}
+pub enum Filter { All, Picks, Unrated }
 
 // ── app state ──────────────────────────────────────────────────────────────
 
@@ -47,11 +40,8 @@ pub struct CullApp {
     folder: Option<PathBuf>,
     images: Vec<ImageEntry>,
 
-    /// Cursor — the image shown in the main view.
     selected: usize,
-    /// Multi-select set for batch operations. Always contains `selected`.
     selected_set: HashSet<usize>,
-    /// Anchor for shift-range selection.
     anchor: usize,
 
     filter: Filter,
@@ -64,13 +54,18 @@ pub struct CullApp {
     res_rx: mpsc::Receiver<LoadResult>,
 
     status: String,
-
-    /// Set when keyboard navigation changes the cursor. Cleared after one
-    /// frame of scroll_to_me so manual filmstrip scrolling persists.
     needs_scroll: bool,
-    /// Visible range (indices into current `visible` array) from last frame,
-    /// used for scroll-aware thumb preloading.
     filmstrip_vis: (usize, usize),
+
+    /// Filmstrip panel height — managed manually to avoid egui's sticky resize.
+    filmstrip_height: f32,
+
+    /// Explorer sidebar visibility
+    show_explorer: bool,
+    /// Subdirectories of the current folder's root (computed lazily)
+    explorer_dirs: Vec<PathBuf>,
+    /// Root for the explorer (parent of current folder, or the folder itself)
+    explorer_root: Option<PathBuf>,
 }
 
 impl CullApp {
@@ -85,8 +80,7 @@ impl CullApp {
                     let image = match req.kind {
                         LoadKind::Thumb => load_thumbnail(&req.path, req.rotation),
                         LoadKind::Full  => load_preview(&req.path, req.rotation),
-                    }
-                    .map_err(|e| e.to_string());
+                    }.map_err(|e| e.to_string());
                     let _ = res_tx.send(LoadResult { index: req.index, kind: req.kind, image });
                 });
             }
@@ -107,6 +101,10 @@ impl CullApp {
             status: "Drop a folder here or click Open".into(),
             needs_scroll: true,
             filmstrip_vis: (0, 0),
+            filmstrip_height: 108.0,
+            show_explorer: false,
+            explorer_dirs: Vec::new(),
+            explorer_root: None,
         };
 
         if let Some(path) = preload {
@@ -122,13 +120,18 @@ impl CullApp {
         self.selected = 0;
         self.anchor = 0;
         self.selected_set.clear();
-        self.selected_set.insert(0);
+        if count > 0 { self.selected_set.insert(0); }
         self.thumb_textures.clear();
         self.full_textures.clear();
         self.loading.clear();
         self.status = format!("{count} images");
-        self.folder = Some(path);
         self.needs_scroll = true;
+
+        // Set explorer root to the parent (so sibling folders are visible)
+        let explorer_root = path.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| path.clone());
+        self.explorer_dirs = list_subdirs(&explorer_root);
+        self.explorer_root = Some(explorer_root);
+        self.folder = Some(path);
     }
 
     fn visible_indices(&self) -> Vec<usize> {
@@ -170,36 +173,32 @@ impl CullApp {
         }
     }
 
-    /// Apply mark to all images in the selection set.
     fn apply_mark(&mut self, mark: Mark) {
         for idx in self.selected_set.clone() {
             self.set_mark_single(idx, mark.clone());
         }
     }
 
+    /// Rotate all images in the selection set.
     fn rotate(&mut self, delta: i8) {
-        let idx = self.selected;
-        if idx >= self.images.len() { return; }
-        let img = &mut self.images[idx];
-        img.rotation = ((img.rotation as i8 + delta).rem_euclid(4)) as u8;
-        xmp::write_rotation(&img.path.clone(), img.rotation);
+        for idx in self.selected_set.clone() {
+            if idx >= self.images.len() { continue; }
+            let img = &mut self.images[idx];
+            img.rotation = ((img.rotation as i8 + delta).rem_euclid(4)) as u8;
+            xmp::write_rotation(&img.path.clone(), img.rotation);
 
-        // Evict textures so they re-decode with new rotation
-        self.full_textures.remove(&idx);
-        self.thumb_textures.remove(&idx);
-        self.loading.remove(&(idx, LoadKind::Full));
-        self.loading.remove(&(idx, LoadKind::Thumb));
+            self.full_textures.remove(&idx);
+            self.thumb_textures.remove(&idx);
+            self.loading.remove(&(idx, LoadKind::Full));
+            self.loading.remove(&(idx, LoadKind::Thumb));
+        }
     }
 
     fn export_picks(&mut self) {
-        let folder = match &self.folder {
-            Some(f) => f.clone(),
-            None => return,
-        };
+        let folder = match &self.folder { Some(f) => f.clone(), None => return };
         let dest = folder.join("_picks");
         if let Err(e) = std::fs::create_dir_all(&dest) {
-            self.status = format!("Export failed: {e}");
-            return;
+            self.status = format!("Export failed: {e}"); return;
         }
         let mut n = 0usize;
         for img in self.images.iter().filter(|i| i.mark == Mark::Pick) {
@@ -212,7 +211,6 @@ impl CullApp {
 
     // ── selection helpers ──────────────────────────────────────────────────
 
-    /// Move cursor, clear multi-select.
     fn nav_to(&mut self, idx: usize) {
         self.selected = idx;
         self.anchor = idx;
@@ -221,25 +219,20 @@ impl CullApp {
         self.needs_scroll = true;
     }
 
-    /// Extend selection from anchor to idx (inclusive range in `visible` order).
     fn shift_select_to(&mut self, idx: usize, visible: &[usize]) {
         self.selected = idx;
         let a = visible.iter().position(|&i| i == self.anchor).unwrap_or(0);
         let b = visible.iter().position(|&i| i == idx).unwrap_or(0);
         let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
         self.selected_set.clear();
-        for i in lo..=hi {
-            self.selected_set.insert(visible[i]);
-        }
+        for i in lo..=hi { self.selected_set.insert(visible[i]); }
         self.needs_scroll = true;
     }
 
-    /// Toggle a single index in selection (⌘-click).
     fn toggle_select(&mut self, idx: usize) {
         if self.selected_set.contains(&idx) && self.selected_set.len() > 1 {
             self.selected_set.remove(&idx);
             if self.selected == idx {
-                // move cursor to another member of the set
                 self.selected = *self.selected_set.iter().next().unwrap();
             }
         } else {
@@ -254,7 +247,7 @@ impl CullApp {
 
 impl eframe::App for CullApp {
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
-        // 1. Drain loader results
+        // 1. Drain loader
         while let Ok(r) = self.res_rx.try_recv() {
             self.loading.remove(&(r.index, r.kind));
             if let Ok(img) = r.image {
@@ -277,9 +270,9 @@ impl eframe::App for CullApp {
             self.open_folder(folder);
         }
 
-        // 3. Keyboard input — extract everything from ctx.input in one go
+        // 3. Keyboard
         let (nav_next, nav_prev, do_pick, do_reject, do_unmark, do_export,
-             rotate_ccw, rotate_cw, shift, cmd) = ctx.input(|i| (
+             rotate_ccw, rotate_cw, toggle_explorer, shift, cmd) = ctx.input(|i| (
             i.key_pressed(Key::ArrowRight) || i.key_pressed(Key::ArrowDown),
             i.key_pressed(Key::ArrowLeft)  || i.key_pressed(Key::ArrowUp),
             i.key_pressed(Key::P) || i.key_pressed(Key::Space),
@@ -288,42 +281,34 @@ impl eframe::App for CullApp {
             i.key_pressed(Key::E) && i.modifiers.command,
             i.key_pressed(Key::R) && !i.modifiers.shift,
             i.key_pressed(Key::R) && i.modifiers.shift,
+            i.key_pressed(Key::B) && i.modifiers.command,
             i.modifiers.shift,
             i.modifiers.command,
         ));
+
+        if toggle_explorer { self.show_explorer = !self.show_explorer; }
 
         // 4. Process input
         let visible = self.visible_indices();
         if !visible.is_empty() {
             let cur = visible.iter().position(|&i| i == self.selected).unwrap_or(0);
-
             if nav_next && cur + 1 < visible.len() {
                 let next = visible[cur + 1];
-                if shift {
-                    self.shift_select_to(next, &visible);
-                } else {
-                    self.nav_to(next);
-                }
+                if shift { self.shift_select_to(next, &visible); } else { self.nav_to(next); }
             }
             if nav_prev && cur > 0 {
                 let prev = visible[cur - 1];
-                if shift {
-                    self.shift_select_to(prev, &visible);
-                } else {
-                    self.nav_to(prev);
-                }
+                if shift { self.shift_select_to(prev, &visible); } else { self.nav_to(prev); }
             }
             if do_pick {
-                let mark = if self.selected_set.iter().all(|&i| self.images[i].mark == Mark::Pick) {
-                    Mark::None
-                } else { Mark::Pick };
-                self.apply_mark(mark);
+                let m = if self.selected_set.iter().all(|&i| self.images[i].mark == Mark::Pick)
+                    { Mark::None } else { Mark::Pick };
+                self.apply_mark(m);
             }
             if do_reject {
-                let mark = if self.selected_set.iter().all(|&i| self.images[i].mark == Mark::Reject) {
-                    Mark::None
-                } else { Mark::Reject };
-                self.apply_mark(mark);
+                let m = if self.selected_set.iter().all(|&i| self.images[i].mark == Mark::Reject)
+                    { Mark::None } else { Mark::Reject };
+                self.apply_mark(m);
             }
             if do_unmark  { self.apply_mark(Mark::None); }
             if rotate_ccw { self.rotate(1); }
@@ -335,9 +320,7 @@ impl eframe::App for CullApp {
         let visible = self.visible_indices();
         let (fv_s, fv_e) = self.filmstrip_vis;
         let buf = 8;
-        let ts = fv_s.saturating_sub(buf);
-        let te = (fv_e + buf).min(visible.len().saturating_sub(1));
-        for i in ts..=te {
+        for i in fv_s.saturating_sub(buf)..=(fv_e + buf).min(visible.len().saturating_sub(1)) {
             if let Some(&idx) = visible.get(i) { self.request(idx, LoadKind::Thumb); }
         }
         if let Some(pos) = visible.iter().position(|&i| i == self.selected) {
@@ -349,7 +332,8 @@ impl eframe::App for CullApp {
 
         // 6. Render
         let visible = self.visible_indices();
-        self.render_toolbar(ctx, &visible, cmd);
+        self.render_toolbar(ctx);
+        self.render_explorer(ctx);
         self.render_filmstrip(ctx, &visible, shift, cmd);
         self.render_main(ctx, &visible);
     }
@@ -358,29 +342,50 @@ impl eframe::App for CullApp {
 // ── rendering ──────────────────────────────────────────────────────────────
 
 impl CullApp {
-    fn render_toolbar(&mut self, ctx: &Context, visible: &[usize], _cmd: bool) {
+    fn render_toolbar(&mut self, ctx: &Context) {
         let total   = self.images.len();
         let picks   = self.images.iter().filter(|i| i.mark == Mark::Pick).count();
         let unrated = self.images.iter().filter(|i| i.mark == Mark::None).count();
         let sel_n   = self.selected_set.len();
+        let visible = self.visible_indices();
 
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                if ui.button("Open Folder").clicked() {
+                // Explorer toggle
+                let explorer_label = if self.show_explorer { "Hide" } else { "Files" };
+                if ui.button(explorer_label).clicked() {
+                    self.show_explorer = !self.show_explorer;
+                }
+
+                ui.separator();
+
+                // Folder breadcrumb — shows current folder name, click to change
+                if let Some(folder) = &self.folder.clone() {
+                    let label = folder.file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("…");
+                    if ui.button(format!("📁 {label}")).on_hover_text(folder.display().to_string()).clicked() {
+                        if let Some(p) = rfd::FileDialog::new()
+                            .set_directory(folder)
+                            .pick_folder()
+                        {
+                            self.open_folder(p);
+                        }
+                    }
+                } else if ui.button("📁 Open Folder").clicked() {
                     if let Some(p) = rfd::FileDialog::new().pick_folder() {
                         self.open_folder(p);
                     }
                 }
+
                 ui.separator();
 
                 ui.selectable_value(&mut self.filter, Filter::All,     format!("All  {total}"));
                 ui.selectable_value(&mut self.filter, Filter::Picks,   format!("Picks  {picks}"));
                 ui.selectable_value(&mut self.filter, Filter::Unrated, format!("Unrated  {unrated}"));
 
-                ui.separator();
-
-                // Batch ops — always shown, operate on selected_set
                 if sel_n > 1 {
+                    ui.separator();
                     ui.label(format!("{sel_n} selected"));
                     if ui.button("Pick").clicked()   { self.apply_mark(Mark::Pick); }
                     if ui.button("Reject").clicked() { self.apply_mark(Mark::Reject); }
@@ -403,8 +408,89 @@ impl CullApp {
         });
     }
 
+    fn render_explorer(&mut self, ctx: &Context) {
+        if !self.show_explorer { return; }
+
+        let current_folder = self.folder.clone();
+        let dirs = self.explorer_dirs.clone();
+        let mut navigate_to: Option<PathBuf> = None;
+
+        egui::SidePanel::left("explorer")
+            .resizable(true)
+            .default_width(200.0)
+            .min_width(140.0)
+            .max_width(400.0)
+            .show(ctx, |ui| {
+                ui.heading("Folders");
+                ui.separator();
+
+                // Show parent (..) navigation
+                if let Some(root) = &self.explorer_root.clone() {
+                    if let Some(parent) = root.parent() {
+                        if ui.selectable_label(false, "⬆ ..").clicked() {
+                            navigate_to = Some(parent.to_path_buf());
+                        }
+                    }
+                }
+
+                ScrollArea::vertical().show(ui, |ui| {
+                    for dir in &dirs {
+                        let dir_name = dir.file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("?");
+
+                        let is_current = current_folder.as_ref() == Some(dir);
+
+                        let label = if is_current {
+                            format!("▸ {dir_name}")
+                        } else {
+                            format!("  {dir_name}")
+                        };
+
+                        let response = ui.selectable_label(is_current, &label);
+
+                        // Click to navigate into that folder
+                        if response.clicked() && !is_current {
+                            navigate_to = Some(dir.clone());
+                        }
+
+                        // Drop target — move selected images into this folder
+                        if !is_current {
+                            let drop_response = response.on_hover_text("Drop selected images here");
+                            if drop_response.hovered() && ctx.input(|i| i.pointer.any_released()) {
+                                // Check if we were dragging (had a selection and released over this)
+                                // For now, show as a potential drop target
+                            }
+                        }
+                    }
+                });
+
+                ui.separator();
+
+                // Move-to button for selected images
+                if self.selected_set.len() > 0 && !dirs.is_empty() {
+                    ui.label(format!("{} selected", self.selected_set.len()));
+                    ui.horizontal_wrapped(|ui| {
+                        for dir in &dirs {
+                            let is_current = current_folder.as_ref() == Some(dir);
+                            if is_current { continue; }
+                            let name = dir.file_name()
+                                .and_then(|n| n.to_str())
+                                .unwrap_or("?");
+                            if ui.small_button(format!("→ {name}")).clicked() {
+                                self.move_selected_to(dir);
+                            }
+                        }
+                    });
+                }
+            });
+
+        if let Some(path) = navigate_to {
+            self.open_folder(path);
+        }
+    }
+
     fn render_filmstrip(&mut self, ctx: &Context, visible: &[usize], shift: bool, cmd: bool) {
-        // Pre-collect data for the closure
         struct TD {
             idx: usize,
             vis_pos: usize,
@@ -415,8 +501,7 @@ impl CullApp {
         }
 
         let td: Vec<TD> = visible.iter().enumerate().map(|(vis_pos, &idx)| TD {
-            idx,
-            vis_pos,
+            idx, vis_pos,
             is_cursor: idx == self.selected,
             in_set: self.selected_set.contains(&idx),
             mark: self.images[idx].mark.clone(),
@@ -426,112 +511,118 @@ impl CullApp {
         }).collect();
 
         let needs_scroll = self.needs_scroll;
-        let mut clicked: Option<(usize, bool, bool)> = None; // (idx, shift, cmd)
+        let mut clicked: Option<(usize, bool, bool)> = None;
         let mut new_vis: (usize, usize) = (usize::MAX, 0);
 
-        egui::TopBottomPanel::bottom("filmstrip")
-            .resizable(true)
-            .min_height(80.0)
-            .default_height(108.0)
+        // Manual resize separator — avoids egui's sticky resizable() behavior.
+        // Paint a thin drag handle above the filmstrip panel.
+        let filmstrip_h = self.filmstrip_height;
+        egui::TopBottomPanel::bottom("filmstrip_resize")
+            .exact_height(6.0)
             .show(ctx, |ui| {
-                // Responsive item size — scales with panel height
-                let avail_h = ui.available_height() - 8.0;
-                let n_rows = ((avail_h / 100.0).floor() as usize).max(1).min(4);
-                let item_px = ((avail_h / n_rows as f32) - 6.0).clamp(50.0, 280.0);
+                let response = ui.allocate_response(
+                    Vec2::new(ui.available_width(), 6.0),
+                    Sense::drag(),
+                );
+                // Subtle visual handle
+                let rect = response.rect;
+                ui.painter().rect_filled(rect, 0.0, Color32::from_gray(45));
+                ui.painter().line_segment(
+                    [rect.center_top() + egui::vec2(0.0, 2.0),
+                     rect.center_top() + egui::vec2(0.0, 4.0)],
+                    Stroke::new(20.0, Color32::from_gray(70)),
+                );
+                if response.dragged() {
+                    self.filmstrip_height = (filmstrip_h - response.drag_delta().y)
+                        .clamp(60.0, 600.0);
+                }
+                if response.hovered() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
+                }
+            });
+
+        egui::TopBottomPanel::bottom("filmstrip")
+            .exact_height(self.filmstrip_height)
+            .show(ctx, |ui| {
+                let avail_h = ui.available_height();
+                let item_px = (avail_h - 12.0).clamp(50.0, 400.0);
 
                 ScrollArea::horizontal()
                     .id_salt("filmstrip_scroll")
                     .show(ui, |ui| {
-                        ui.horizontal_top(|ui| {
+                        ui.horizontal(|ui| {
                             ui.add_space(4.0);
+                            for t in &td {
+                                let (response, painter) = ui.allocate_painter(
+                                    Vec2::new(item_px + 4.0, item_px + 4.0),
+                                    Sense::click(),
+                                );
 
-                            let n_cols = (td.len() + n_rows - 1) / n_rows;
-                            for col in 0..n_cols {
-                                ui.vertical(|ui| {
-                                    for row in 0..n_rows {
-                                        let item_i = col * n_rows + row;
-                                        let Some(t) = td.get(item_i) else {
-                                            // empty slot at end of last column
-                                            ui.add_space(item_px + 4.0);
-                                            continue;
-                                        };
+                                if response.rect.intersects(ui.clip_rect()) {
+                                    new_vis.0 = new_vis.0.min(t.vis_pos);
+                                    new_vis.1 = new_vis.1.max(t.vis_pos);
+                                }
 
-                                        let (response, painter) = ui.allocate_painter(
-                                            Vec2::splat(item_px + 4.0), Sense::click(),
-                                        );
+                                if response.clicked() {
+                                    clicked = Some((t.idx, shift, cmd));
+                                }
+                                if t.is_cursor && needs_scroll {
+                                    response.scroll_to_me(Some(Align::Center));
+                                }
 
-                                        // Track viewport for smart preloading
-                                        if response.rect.intersects(ui.clip_rect()) {
-                                            new_vis.0 = new_vis.0.min(t.vis_pos);
-                                            new_vis.1 = new_vis.1.max(t.vis_pos);
-                                        }
+                                let bg = if t.in_set && !t.is_cursor {
+                                    Color32::from_rgba_premultiplied(30, 55, 110, 255)
+                                } else {
+                                    Color32::from_gray(20)
+                                };
+                                let rect = response.rect.shrink(2.0);
+                                painter.rect_filled(rect, 2.0, bg);
 
-                                        if response.clicked() {
-                                            clicked = Some((t.idx, shift, cmd));
-                                        }
-                                        if t.is_cursor && needs_scroll {
-                                            response.scroll_to_me(Some(Align::Center));
-                                        }
+                                if let Some(tex_id) = t.tex_id {
+                                    painter.image(
+                                        tex_id, rect,
+                                        Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                                        Color32::WHITE,
+                                    );
+                                }
 
-                                        // Background — blue tint when in multi-select
-                                        let bg = if t.in_set && !t.is_cursor {
-                                            Color32::from_rgba_premultiplied(30, 55, 110, 255)
-                                        } else {
-                                            Color32::from_gray(20)
-                                        };
-                                        let rect = response.rect.shrink(2.0);
-                                        painter.rect_filled(rect, 2.0, bg);
-
-                                        // Image
-                                        if let Some(tex_id) = t.tex_id {
-                                            painter.image(
-                                                tex_id, rect,
-                                                Rect::from_min_max(
-                                                    egui::pos2(0.0, 0.0),
-                                                    egui::pos2(1.0, 1.0),
-                                                ),
-                                                Color32::WHITE,
-                                            );
-                                        }
-
-                                        // Border
-                                        let (bcolor, bwidth) = if t.is_cursor {
-                                            (Color32::WHITE, 2.5)
-                                        } else if t.in_set {
-                                            (Color32::from_rgb(80, 140, 230), 2.0)
-                                        } else {
-                                            match &t.mark {
-                                                Mark::Pick   => (Color32::from_rgb(72, 199, 116), 1.5),
-                                                Mark::Reject => (Color32::from_rgb(220, 80, 80), 1.5),
-                                                Mark::None   => (Color32::from_gray(50), 1.0),
-                                            }
-                                        };
-                                        painter.rect_stroke(
-                                            response.rect.shrink(1.0), 2.0,
-                                            Stroke::new(bwidth, bcolor),
-                                        );
-
-                                        // Mark badge
-                                        if let Some((label, color)) = match t.mark {
-                                            Mark::Pick   => Some(("P", Color32::from_rgb(72, 199, 116))),
-                                            Mark::Reject => Some(("R", Color32::from_rgb(220, 80, 80))),
-                                            Mark::None   => None,
-                                        } {
-                                            let b = Rect::from_min_size(rect.min, Vec2::new(14.0, 14.0));
-                                            painter.rect_filled(b, 0.0, Color32::from_black_alpha(160));
-                                            painter.text(b.center(), egui::Align2::CENTER_CENTER, label, FontId::proportional(10.0), color);
-                                        }
-
-                                        ui.add_space(2.0);
+                                let (bc, bw) = if t.is_cursor {
+                                    (Color32::WHITE, 2.5)
+                                } else if t.in_set {
+                                    (Color32::from_rgb(80, 140, 230), 2.0)
+                                } else {
+                                    match &t.mark {
+                                        Mark::Pick   => (Color32::from_rgb(72, 199, 116), 1.5),
+                                        Mark::Reject => (Color32::from_rgb(220, 80, 80), 1.5),
+                                        Mark::None   => (Color32::from_gray(50), 1.0),
                                     }
-                                });
+                                };
+                                painter.rect_stroke(
+                                    response.rect.shrink(1.0), 2.0,
+                                    Stroke::new(bw, bc),
+                                );
+
+                                // Mark badge — scale with item
+                                let badge_sz = (item_px * 0.16).clamp(12.0, 20.0);
+                                if let Some((label, color)) = match t.mark {
+                                    Mark::Pick   => Some(("P", Color32::from_rgb(72, 199, 116))),
+                                    Mark::Reject => Some(("R", Color32::from_rgb(220, 80, 80))),
+                                    Mark::None   => None,
+                                } {
+                                    let b = Rect::from_min_size(rect.min, Vec2::splat(badge_sz));
+                                    painter.rect_filled(b, 0.0, Color32::from_black_alpha(160));
+                                    painter.text(
+                                        b.center(), egui::Align2::CENTER_CENTER, label,
+                                        FontId::proportional(badge_sz * 0.65), color,
+                                    );
+                                }
+
                                 ui.add_space(2.0);
                             }
                         });
                     });
             });
 
-        // Process clicks after the panel (no borrow conflict)
         if let Some((idx, is_shift, is_cmd)) = clicked {
             let vis = self.visible_indices();
             if is_shift {
@@ -541,25 +632,22 @@ impl CullApp {
             } else {
                 self.nav_to(idx);
             }
-            // Don't scroll on click — the clicked item is already visible
             self.needs_scroll = false;
         }
 
-        if new_vis.0 != usize::MAX {
-            self.filmstrip_vis = new_vis;
-        }
+        if new_vis.0 != usize::MAX { self.filmstrip_vis = new_vis; }
         self.needs_scroll = false;
     }
 
     fn render_main(&mut self, ctx: &Context, visible: &[usize]) {
-        let is_empty    = self.images.is_empty();
-        let no_visible  = visible.is_empty();
-        let selected    = self.selected;
-        let filename    = self.images.get(selected).map(|e| e.filename().to_string());
-        let mark        = self.images.get(selected).map(|e| e.mark.clone());
-        let rotation    = self.images.get(selected).map(|e| e.rotation).unwrap_or(0);
-        let vis_pos     = visible.iter().position(|&i| i == selected).map(|p| p + 1).unwrap_or(1);
-        let vis_total   = visible.len();
+        let is_empty   = self.images.is_empty();
+        let no_visible = visible.is_empty();
+        let selected   = self.selected;
+        let filename   = self.images.get(selected).map(|e| e.filename().to_string());
+        let mark       = self.images.get(selected).map(|e| e.mark.clone());
+        let rotation   = self.images.get(selected).map(|e| e.rotation).unwrap_or(0);
+        let vis_pos    = visible.iter().position(|&i| i == selected).map(|p| p + 1).unwrap_or(1);
+        let vis_total  = visible.len();
 
         let tex_info = self.full_textures.get(&selected)
             .or_else(|| self.thumb_textures.get(&selected))
@@ -601,11 +689,10 @@ impl CullApp {
             let painter    = ui.painter();
             let panel_rect = ui.max_rect();
 
-            // Bottom bar overlay
             let rot_label = match rotation { 1 => " ↺90", 2 => " ↻180", 3 => " ↻90", _ => "" };
             let info = format!(
                 "{}{}   {vis_pos}/{vis_total}   \
-                 [P] pick  [X] reject  [U] unmark  [R] rotate  [←→] nav  [⌘E] export",
+                 [P] pick  [X] reject  [U] unmark  [R] rotate  [←→] nav  [⌘B] files  [⌘E] export",
                 filename.as_deref().unwrap_or(""), rot_label,
             );
             painter.rect_filled(
@@ -629,7 +716,6 @@ impl CullApp {
                 );
             }
 
-            // Mark badge
             if let Some(mark) = mark {
                 let (text, color) = match mark {
                     Mark::Pick   => ("PICK",   Color32::from_rgb(72, 199, 116)),
@@ -646,4 +732,73 @@ impl CullApp {
             }
         });
     }
+
+    /// Move all selected images to a target directory.
+    fn move_selected_to(&mut self, target: &std::path::Path) {
+        let mut moved = 0usize;
+        let mut indices: Vec<usize> = self.selected_set.iter().cloned().collect();
+        indices.sort_unstable_by(|a, b| b.cmp(a)); // reverse order so removal doesn't shift
+
+        for idx in &indices {
+            let img = &self.images[*idx];
+            if let Some(name) = img.path.file_name() {
+                let dest = target.join(name);
+                if std::fs::rename(&img.path, &dest).is_ok() {
+                    // Also move XMP sidecar if it exists
+                    let sidecar = xmp::sidecar_path(&img.path);
+                    if sidecar.exists() {
+                        let sidecar_dest = target.join(sidecar.file_name().unwrap());
+                        let _ = std::fs::rename(&sidecar, sidecar_dest);
+                    }
+                    moved += 1;
+                }
+            }
+        }
+
+        // Remove moved images from the list (indices are sorted descending)
+        for idx in &indices {
+            self.images.remove(*idx);
+            self.thumb_textures.remove(idx);
+            self.full_textures.remove(idx);
+        }
+
+        // Fix selected state
+        self.selected_set.clear();
+        if !self.images.is_empty() {
+            self.selected = self.selected.min(self.images.len() - 1);
+            self.selected_set.insert(self.selected);
+        } else {
+            self.selected = 0;
+        }
+        self.anchor = self.selected;
+        self.needs_scroll = true;
+
+        // Rebuild texture index since indices shifted
+        self.thumb_textures.clear();
+        self.full_textures.clear();
+        self.loading.clear();
+
+        self.status = format!("Moved {moved} images");
+    }
+}
+
+// ── helpers ────────────────────────────────────────────────────────────────
+
+/// List immediate subdirectories, sorted by name.
+fn list_subdirs(root: &std::path::Path) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = std::fs::read_dir(root)
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+        .filter(|e| {
+            // Hide hidden dirs and common non-image dirs
+            let name = e.file_name();
+            let n = name.to_str().unwrap_or("");
+            !n.starts_with('.') && n != "_picks" && n != "node_modules"
+        })
+        .map(|e| e.path())
+        .collect();
+    dirs.sort();
+    dirs
 }

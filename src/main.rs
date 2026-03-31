@@ -47,7 +47,13 @@ fn main() {
         Some(Command::Stats { folder }) => cli::cmd_stats(&folder),
         Some(Command::Export { folder }) => cli::cmd_export(&folder),
         Some(Command::Mark { file, mark }) => cli::cmd_mark(&file, mark),
-        None => run_gui(cli.folder),
+        None => {
+            // Default to CWD; resolve relative paths like "." to absolute
+            let folder = cli.folder
+                .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+            let folder = std::fs::canonicalize(&folder).unwrap_or(folder);
+            run_gui(Some(folder));
+        }
     }
 }
 
