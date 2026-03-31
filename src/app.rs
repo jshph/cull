@@ -150,6 +150,8 @@ pub struct CullApp {
     status: String,
     needs_scroll: bool,
     filmstrip_vis: (usize, usize),
+    /// Number of columns in the filmstrip grid (1 when in strip mode).
+    filmstrip_cols: usize,
 
     /// Filmstrip panel height — managed manually to avoid egui's sticky resize.
     filmstrip_height: f32,
@@ -244,6 +246,7 @@ impl CullApp {
             status: "Drop a folder here or click Open".into(),
             needs_scroll: true,
             filmstrip_vis: (0, 0),
+            filmstrip_cols: 1,
             filmstrip_height: saved.filmstrip_height,
             prev_frame_height: 0.0,
             show_explorer: false,
@@ -622,10 +625,13 @@ impl eframe::App for CullApp {
         }
 
         // 3. Keyboard
-        let (nav_next, nav_prev, do_pick, do_reject, do_unmark, do_export,
+        let (nav_right, nav_left, nav_down, nav_up,
+             do_pick, do_reject, do_unmark, do_export,
              rotate_ccw, rotate_cw, toggle_explorer, shift, cmd) = ctx.input(|i| (
-            i.key_pressed(Key::ArrowRight) || i.key_pressed(Key::ArrowDown),
-            i.key_pressed(Key::ArrowLeft)  || i.key_pressed(Key::ArrowUp),
+            i.key_pressed(Key::ArrowRight),
+            i.key_pressed(Key::ArrowLeft),
+            i.key_pressed(Key::ArrowDown),
+            i.key_pressed(Key::ArrowUp),
             i.key_pressed(Key::P) || i.key_pressed(Key::Space),
             i.key_pressed(Key::X),
             i.key_pressed(Key::U),
@@ -643,13 +649,31 @@ impl eframe::App for CullApp {
         let visible = self.visible_indices();
         if !visible.is_empty() {
             let cur = visible.iter().position(|&i| i == self.selected).unwrap_or(0);
-            if nav_next && cur + 1 < visible.len() {
+            let cols = self.filmstrip_cols;
+
+            // Left/Right: move by one item
+            if nav_right && cur + 1 < visible.len() {
                 let next = visible[cur + 1];
                 if shift { self.shift_select_to(next, &visible); } else { self.nav_to(next); }
             }
-            if nav_prev && cur > 0 {
+            if nav_left && cur > 0 {
                 let prev = visible[cur - 1];
                 if shift { self.shift_select_to(prev, &visible); } else { self.nav_to(prev); }
+            }
+            // Down/Up: move by one row (cols items) in grid mode, or one item in strip mode
+            if nav_down {
+                let target = (cur + cols).min(visible.len() - 1);
+                if target != cur {
+                    let next = visible[target];
+                    if shift { self.shift_select_to(next, &visible); } else { self.nav_to(next); }
+                }
+            }
+            if nav_up {
+                let target = cur.saturating_sub(cols);
+                if target != cur {
+                    let prev = visible[target];
+                    if shift { self.shift_select_to(prev, &visible); } else { self.nav_to(prev); }
+                }
             }
             if do_pick {
                 let m = if self.selected_set.iter().all(|&i| self.images[i].mark == Mark::Pick)
@@ -903,6 +927,7 @@ impl CullApp {
         let needs_scroll = self.needs_scroll;
         let mut clicked: Option<(usize, bool, bool)> = None;
         let mut new_vis: (usize, usize) = (usize::MAX, 0);
+        let mut computed_cols: usize = 1;
 
         // Bottom panels stack upward in egui — render filmstrip FIRST so it
         // occupies the bottom edge, then the resize handle sits ABOVE it
@@ -923,6 +948,7 @@ impl CullApp {
                 if multi_row {
                     // ── GRID MODE: vertical scroll, items wrap left→right top→bottom ──
                     let cols = ((avail_w - 8.0) / cell).floor().max(1.0) as usize;
+                    computed_cols = cols;
 
                     ScrollArea::vertical()
                         .id_salt("filmstrip_scroll")
