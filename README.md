@@ -71,7 +71,7 @@ XMP sidecars are written the instant you pick or reject. Import your folder and 
 
 ## Get cull
 
-**Buy a license** at [getcull.com](https://getcull.com) — $14.99 early bird, $29.99 after.
+**Buy a license** at [getcull.fyi](https://getcull.fyi) — $14.99 early bird, $29.99 after.
 
 Or build from source (open source, MIT):
 

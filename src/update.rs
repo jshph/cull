@@ -2,7 +2,7 @@ use std::sync::mpsc;
 use std::thread;
 
 pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
-const VERSION_URL: &str = "https://getcull.com/version.json";
+const VERSION_URL: &str = "https://getcull.fyi/version.json";
 
 #[derive(Debug, Clone)]
 pub struct UpdateInfo {

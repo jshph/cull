@@ -995,7 +995,7 @@ impl CullApp {
                         }
                         if ui.button("Buy license").clicked() {
                             let _ = std::process::Command::new("open")
-                                .arg("https://getcull.com#buy")
+                                .arg("https://getcull.fyi#buy")
                                 .spawn();
                         }
                     });
