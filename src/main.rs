@@ -5,7 +5,9 @@ mod app;
 mod catalog;
 mod cli;
 mod exif;
+mod license;
 mod preview;
+mod update;
 mod xmp;
 
 use clap::{Parser, Subcommand};

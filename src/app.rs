@@ -9,7 +9,9 @@ use egui::{
 
 use crate::catalog::{load_folder, ImageEntry, Mark};
 use crate::exif::ExifInfo;
+use crate::license::{self, LicenseStatus};
 use crate::preview::{load_preview, load_thumbnail};
+use crate::update::{self, UpdateInfo};
 use crate::xmp;
 
 // ── layout constants ───────────────────────────────────────────────────────
@@ -191,6 +193,25 @@ pub struct CullApp {
     editors: Vec<(String, String)>,
     /// Index into `editors` for the preferred editor (0 = first found)
     preferred_editor: usize,
+
+    /// All known tags across the session (for autocomplete)
+    known_tags: Vec<String>,
+    /// Current text in the tag input field
+    tag_input: String,
+    /// Whether the tag input is currently focused (suppresses keyboard shortcuts)
+    tag_input_focused: bool,
+
+    /// License validation status (checked once at startup)
+    license_status: LicenseStatus,
+    /// Whether the license activation dialog is open
+    show_license_dialog: bool,
+    /// Text input buffer for the license key activation dialog
+    license_key_input: String,
+
+    /// Background update check result
+    update_rx: mpsc::Receiver<Option<UpdateInfo>>,
+    /// Available update (set once the background check completes)
+    available_update: Option<UpdateInfo>,
 }
 
 impl CullApp {
@@ -279,6 +300,14 @@ impl CullApp {
             thumb_size: saved.thumb_size,
             editors: detect_editors(),
             preferred_editor: 0,
+            known_tags: Vec::new(),
+            tag_input: String::new(),
+            tag_input_focused: false,
+            license_status: license::load_license(),
+            show_license_dialog: false,
+            license_key_input: String::new(),
+            update_rx: update::check_for_updates(),
+            available_update: None,
         };
 
         if let Some(path) = preload {
@@ -318,6 +347,14 @@ impl CullApp {
         self.lenses_found.clear();
         self.camera_filter.clear();
         self.lens_filter.clear();
+        // Build known_tags from all loaded images
+        let mut tag_set: HashSet<String> = self.known_tags.iter().cloned().collect();
+        for img in &self.images {
+            for t in &img.tags { tag_set.insert(t.clone()); }
+        }
+        self.known_tags = tag_set.into_iter().collect();
+        self.known_tags.sort();
+        self.tag_input.clear();
         let (tx, rx) = mpsc::channel();
         self.exif_rx = rx;
         self.exif_tx_template = tx.clone();
@@ -501,6 +538,36 @@ impl CullApp {
         }
     }
 
+    /// Add a tag to all selected images.
+    fn add_tag(&mut self, tag: String) {
+        if tag.is_empty() { return; }
+        // Add to known tags
+        if !self.known_tags.contains(&tag) {
+            self.known_tags.push(tag.clone());
+            self.known_tags.sort();
+        }
+        for idx in self.selected_set.clone() {
+            if idx >= self.images.len() { continue; }
+            let img = &mut self.images[idx];
+            if !img.tags.contains(&tag) {
+                img.tags.push(tag.clone());
+                xmp::write_tags(&img.path, &img.tags);
+            }
+        }
+    }
+
+    /// Remove a tag from all selected images.
+    fn remove_tag(&mut self, tag: &str) {
+        for idx in self.selected_set.clone() {
+            if idx >= self.images.len() { continue; }
+            let img = &mut self.images[idx];
+            if let Some(pos) = img.tags.iter().position(|t| t == tag) {
+                img.tags.remove(pos);
+                xmp::write_tags(&img.path, &img.tags);
+            }
+        }
+    }
+
     /// Rotate all images in the selection set.
     fn rotate(&mut self, delta: i8) {
         for idx in self.selected_set.clone() {
@@ -680,7 +747,14 @@ impl eframe::App for CullApp {
             }
         }
 
-        // 1b. Window resize → filmstrip absorbs the delta so preview stays stable
+        // 1b. Drain update check
+        if self.available_update.is_none() {
+            if let Ok(info) = self.update_rx.try_recv() {
+                self.available_update = info;
+            }
+        }
+
+        // 1c. Window resize → filmstrip absorbs the delta so preview stays stable
         let screen = ctx.screen_rect();
         let current_h = screen.height();
         let current_w = screen.width();
@@ -710,25 +784,28 @@ impl eframe::App for CullApp {
             self.open_folder(folder);
         }
 
-        // 3. Keyboard
+        // 3. Keyboard (letter keys suppressed when tag input has focus)
+        let no_text_focus = !self.tag_input_focused;
         let (nav_right, nav_left, nav_down, nav_up,
              do_pick, do_reject, do_unmark,
              do_send_to_editor, do_export_picks,
-             rotate_ccw, rotate_cw, toggle_explorer, shift, cmd) = ctx.input(|i| (
+             rotate_ccw, rotate_cw, toggle_explorer,
+             do_focus_tags, shift, cmd) = ctx.input(|i| (
             i.key_pressed(Key::ArrowRight),
             i.key_pressed(Key::ArrowLeft),
             i.key_pressed(Key::ArrowDown),
             i.key_pressed(Key::ArrowUp),
-            i.key_pressed(Key::P) || i.key_pressed(Key::Space),
-            i.key_pressed(Key::X),
-            i.key_pressed(Key::U),
-            // Cmd+E = send to editor (like Photo Mechanic)
+            no_text_focus && (i.key_pressed(Key::P) || i.key_pressed(Key::Space)),
+            no_text_focus && i.key_pressed(Key::X),
+            no_text_focus && i.key_pressed(Key::U),
+            // Cmd+E = send to editor
             i.key_pressed(Key::E) && i.modifiers.command && !i.modifiers.shift,
             // Cmd+Shift+E = export picks to _picks/ folder
             i.key_pressed(Key::E) && i.modifiers.command && i.modifiers.shift,
-            i.key_pressed(Key::R) && !i.modifiers.shift,
-            i.key_pressed(Key::R) && i.modifiers.shift,
+            no_text_focus && i.key_pressed(Key::R) && !i.modifiers.shift,
+            no_text_focus && i.key_pressed(Key::R) && i.modifiers.shift,
             i.key_pressed(Key::B) && i.modifiers.command,
+            no_text_focus && i.key_pressed(Key::T) && !i.modifiers.command,
             i.modifiers.shift,
             i.modifiers.command,
         ));
@@ -779,6 +856,7 @@ impl eframe::App for CullApp {
             if rotate_ccw { self.rotate(1); }
             if rotate_cw  { self.rotate(-1); }
         }
+        if do_focus_tags { self.tag_input_focused = true; }
         if do_send_to_editor { self.send_to_editor(); }
         if do_export_picks   { self.export_picks(); }
 
@@ -856,6 +934,74 @@ impl CullApp {
 
         // Only show file type filter when both types are present
         let has_mixed_types = n_raw > 0 && n_jpeg > 0;
+
+        // License activation dialog
+        if self.show_license_dialog {
+            let mut open = self.show_license_dialog;
+            egui::Window::new("License")
+                .open(&mut open)
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .fixed_size([360.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.spacing_mut().item_spacing.y = 8.0;
+
+                    match &self.license_status {
+                        LicenseStatus::Licensed { license_type, email } => {
+                            ui.label(egui::RichText::new(format!("Licensed ({})", license_type))
+                                .color(Color32::from_rgb(74, 124, 89)));
+                            ui.label(format!("Registered to {}", email));
+                        }
+                        LicenseStatus::Trial { days_remaining } => {
+                            ui.label(egui::RichText::new(format!("Trial — {} days remaining", days_remaining))
+                                .color(Color32::from_rgb(180, 160, 90)));
+                        }
+                        LicenseStatus::Expired => {
+                            ui.label(egui::RichText::new("License expired")
+                                .color(Color32::from_rgb(180, 80, 80)));
+                        }
+                        LicenseStatus::Unlicensed => {
+                            ui.label(egui::RichText::new("No license key found")
+                                .color(Color32::from_rgb(180, 80, 80)));
+                        }
+                    }
+
+                    ui.separator();
+                    ui.label("Enter license key:");
+                    let response = ui.text_edit_singleline(&mut self.license_key_input);
+                    if response.gained_focus() {
+                        self.tag_input_focused = true;
+                    }
+                    if response.lost_focus() {
+                        self.tag_input_focused = false;
+                    }
+
+                    ui.horizontal(|ui| {
+                        if ui.button("Activate").clicked() && !self.license_key_input.is_empty() {
+                            let key = self.license_key_input.trim().to_string();
+                            let status = license::validate_license_key(&key);
+                            match &status {
+                                LicenseStatus::Licensed { .. } | LicenseStatus::Trial { .. } => {
+                                    let _ = license::save_license(&key);
+                                    self.license_status = status;
+                                    self.license_key_input.clear();
+                                    self.show_license_dialog = false;
+                                }
+                                _ => {
+                                    self.license_key_input = "Invalid key".to_string();
+                                }
+                            }
+                        }
+                        if ui.button("Buy license").clicked() {
+                            let _ = std::process::Command::new("open")
+                                .arg("https://getcull.com#buy")
+                                .spawn();
+                        }
+                    });
+                });
+            self.show_license_dialog = open;
+        }
 
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -1011,6 +1157,41 @@ impl CullApp {
                     if !visible.is_empty() {
                         let pos = visible.iter().position(|&i| i == self.selected).map(|p| p + 1).unwrap_or(1);
                         ui.label(format!("{pos} / {}", visible.len()));
+                    }
+
+                    // License badge
+                    ui.separator();
+                    {
+                        let badge_text = license::license_display_text(&self.license_status);
+                        let badge_color = match &self.license_status {
+                            LicenseStatus::Licensed { .. } => Color32::from_rgb(74, 124, 89),
+                            LicenseStatus::Trial { days_remaining } if *days_remaining > 0 => Color32::from_rgb(180, 160, 90),
+                            _ => Color32::from_rgb(180, 80, 80),
+                        };
+                        let badge = egui::RichText::new(badge_text)
+                            .small()
+                            .color(badge_color);
+                        if ui.add(egui::Label::new(badge).sense(Sense::click()))
+                            .on_hover_text("Click to manage license")
+                            .clicked()
+                        {
+                            self.show_license_dialog = true;
+                        }
+                    }
+
+                    // Update available badge
+                    if let Some(ref info) = self.available_update {
+                        ui.separator();
+                        let update_text = egui::RichText::new(format!("v{} available", info.version))
+                            .small()
+                            .color(Color32::from_rgb(100, 160, 220));
+                        if ui.add(egui::Label::new(update_text).sense(Sense::click()))
+                            .on_hover_text("Click to download update")
+                            .clicked()
+                        {
+                            let url = info.download_url.clone();
+                            let _ = std::process::Command::new("open").arg(&url).spawn();
+                        }
                     }
 
                     // Thumbnail size slider
@@ -1437,6 +1618,120 @@ impl CullApp {
                         egui::pos2(panel_rect.right() - 12.0, panel_rect.top() + 20.0),
                         egui::Align2::RIGHT_TOP, text,
                         FontId::proportional(18.0), color,
+                    );
+                }
+            }
+
+            // ── Tag bar (above info bar) ──────────────────────────────────
+            let current_tags: Vec<String> = self.images.get(selected)
+                .map(|img| img.tags.clone()).unwrap_or_default();
+            let show_tag_bar = !current_tags.is_empty() || self.tag_input_focused;
+
+            if show_tag_bar {
+                let tag_bar_y = panel_rect.bottom() - 52.0;
+                let tag_bar_rect = Rect::from_min_max(
+                    egui::pos2(panel_rect.left(), tag_bar_y),
+                    egui::pos2(panel_rect.right(), tag_bar_y + 26.0),
+                );
+                painter.rect_filled(tag_bar_rect, 0.0, Color32::from_black_alpha(180));
+
+                let mut tag_ui = ui.new_child(egui::UiBuilder::new().max_rect(tag_bar_rect).layout(egui::Layout::left_to_right(Align::Center)));
+                tag_ui.spacing_mut().item_spacing = Vec2::new(4.0, 0.0);
+                tag_ui.add_space(8.0);
+
+                // Tag pills
+                let mut tag_to_remove: Option<String> = None;
+                for tag in &current_tags {
+                    let pill = tag_ui.allocate_ui(Vec2::new(0.0, 20.0), |ui| {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 2.0;
+                            let label = ui.label(
+                                egui::RichText::new(tag)
+                                    .color(Color32::WHITE)
+                                    .size(11.0)
+                            );
+                            let x_btn = ui.label(
+                                egui::RichText::new("×")
+                                    .color(Color32::from_gray(150))
+                                    .size(11.0)
+                            );
+                            (label, x_btn)
+                        }).inner
+                    });
+                    let (_, x_resp) = pill.inner;
+                    if x_resp.clicked() {
+                        tag_to_remove = Some(tag.clone());
+                    }
+                }
+                if let Some(tag) = tag_to_remove {
+                    self.remove_tag(&tag);
+                }
+
+                // Tag text input
+                if self.tag_input_focused {
+                    let tag_input_id = egui::Id::new("tag_input");
+                    let resp = tag_ui.add(
+                        egui::TextEdit::singleline(&mut self.tag_input)
+                            .id(tag_input_id)
+                            .desired_width(120.0)
+                            .font(FontId::proportional(11.0))
+                            .hint_text("add tag…")
+                    );
+
+                    // Auto-focus on first frame
+                    if !resp.has_focus() {
+                        resp.request_focus();
+                    }
+                    self.tag_input_focused = resp.has_focus();
+
+                    // Autocomplete popup
+                    let input_lower = self.tag_input.to_lowercase();
+                    let suggestions: Vec<String> = if input_lower.is_empty() {
+                        Vec::new()
+                    } else {
+                        self.known_tags.iter()
+                            .filter(|t| t.to_lowercase().contains(&input_lower)
+                                && !current_tags.contains(t))
+                            .take(5)
+                            .cloned()
+                            .collect()
+                    };
+                    if !suggestions.is_empty() {
+                        let popup_id = egui::Id::new("tag_autocomplete");
+                        egui::popup_below_widget(ui, popup_id, &resp, egui::PopupCloseBehavior::CloseOnClickOutside, |ui| {
+                            for s in &suggestions {
+                                if ui.selectable_label(false, s.as_str()).clicked() {
+                                    self.add_tag(s.clone());
+                                    self.tag_input.clear();
+                                }
+                            }
+                        });
+                        if resp.has_focus() {
+                            ui.memory_mut(|mem| mem.open_popup(popup_id));
+                        }
+                    }
+
+                    // Enter to add tag, Escape to close
+                    if resp.lost_focus() {
+                        let enter = ui.input(|i| i.key_pressed(Key::Enter));
+                        let escape = ui.input(|i| i.key_pressed(Key::Escape));
+                        if enter && !self.tag_input.is_empty() {
+                            let tag = self.tag_input.trim().to_string();
+                            self.add_tag(tag);
+                            self.tag_input.clear();
+                            self.tag_input_focused = true;  // stay open for more tags
+                        } else if escape {
+                            self.tag_input.clear();
+                            self.tag_input_focused = false;
+                        }
+                    }
+                } else {
+                    // Show "T" hint for keyboard shortcut
+                    tag_ui.add_space(4.0);
+                    tag_ui.label(
+                        egui::RichText::new("[T] add tag")
+                            .color(Color32::from_gray(100))
+                            .size(10.0)
                     );
                 }
             }

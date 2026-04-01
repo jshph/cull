@@ -1,2 +1,9 @@
 /target
+/dist
 .enzyme/
+
+# Private — not open sourced
+/site/
+/worker/
+/website/
+/keygen/

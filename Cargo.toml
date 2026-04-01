@@ -2,11 +2,15 @@
 name = "cull"
 version = "0.1.0"
 edition = "2021"
-description = "Blazing-fast photo culling — pick, reject, export. Writes XMP sidecars for Lightroom."
+description = "The fastest photo culling software. Browse thousands of RAW images instantly, pick or reject, export XMP sidecars for Lightroom and Capture One."
 license = "MIT"
 
 [[bin]]
 name = "cull"
+
+[[bin]]
+name = "cull-keygen"
+path = "keygen/main.rs"
 
 [dependencies]
 eframe = "0.29"
@@ -16,6 +20,14 @@ walkdir = "2"
 anyhow = "1"
 rfd = "0.14"
 clap = { version = "4", features = ["derive"] }
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+rand = "0.8"
+base64 = "0.22"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dirs = "5"
+chrono = { version = "0.4", features = ["serde"] }
+ureq = { version = "2", features = ["json"] }
 
 [profile.release]
 opt-level = 3

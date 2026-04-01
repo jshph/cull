@@ -51,11 +51,11 @@ impl ImageEntry {
     }
 }
 
-pub fn load_folder(folder: &Path) -> Vec<ImageEntry> {
+fn collect_images(folder: &Path, max_depth: usize) -> Vec<ImageEntry> {
     let all_exts: Vec<&str> = RAW_EXTS.iter().chain(JPEG_EXTS.iter()).cloned().collect();
 
     walkdir::WalkDir::new(folder)
-        .max_depth(1)
+        .max_depth(max_depth)
         .sort_by_file_name()
         .into_iter()
         .filter_map(|e| e.ok())
@@ -79,4 +79,14 @@ pub fn load_folder(folder: &Path) -> Vec<ImageEntry> {
             }
         })
         .collect()
+}
+
+pub fn load_folder(folder: &Path) -> Vec<ImageEntry> {
+    let images = collect_images(folder, 1);
+    if images.is_empty() {
+        // No direct images — gather from all subfolders
+        collect_images(folder, usize::MAX)
+    } else {
+        images
+    }
 }
