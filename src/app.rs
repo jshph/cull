@@ -995,7 +995,7 @@ impl CullApp {
                         }
                         if ui.button("Buy license").clicked() {
                             let _ = std::process::Command::new("open")
-                                .arg("https://getcull.fyi#buy")
+                                .arg("https://cull.lemonsqueezy.com/checkout/buy/3345aefa-2fc3-460c-bc67-d2afdcab29e5")
                                 .spawn();
                         }
                     });
