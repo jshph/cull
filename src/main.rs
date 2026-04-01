@@ -51,11 +51,10 @@ fn main() {
         Some(Command::Export { folder }) => cli::cmd_export(&folder),
         Some(Command::Mark { file, mark }) => cli::cmd_mark(&file, mark),
         None => {
-            // Default to CWD; resolve relative paths like "." to absolute
-            let folder = cli.folder
-                .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-            let folder = std::fs::canonicalize(&folder).unwrap_or(folder);
-            run_gui(Some(folder));
+            // If a folder was explicitly passed, open it. Otherwise launch empty
+            // — avoids scanning CWD (which is "/" when launched from Finder).
+            let folder = cli.folder.map(|f| std::fs::canonicalize(&f).unwrap_or(f));
+            run_gui(folder);
         }
     }
 }
