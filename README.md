@@ -11,7 +11,7 @@
 </p>
 
 <p align="center">
-  <a href="https://getcull.fyi">Website</a> &middot;
+  <a href="https://www.getcull.fyi">Website</a> &middot;
   <a href="#keyboard-shortcuts">Shortcuts</a> &middot;
   <a href="#lightroom-and-capture-one-integration">LR / C1 Integration</a>
 </p>
@@ -96,7 +96,7 @@ XMP sidecars are written the instant you pick or reject. Import your folder and 
 
 ## Get cull
 
-**[Download](https://getcull.fyi)** a pre-built binary from the website, or build from source:
+**[Download](https://www.getcull.fyi)** a pre-built binary from the website, or build from source:
 
 ```
 cargo build --release
