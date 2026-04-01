@@ -12,7 +12,6 @@
 
 <p align="center">
   <a href="https://getcull.fyi">Website</a> &middot;
-  <a href="https://cull.lemonsqueezy.com/checkout/buy/3345aefa-2fc3-460c-bc67-d2afdcab29e5">Buy ($14.99)</a> &middot;
   <a href="#keyboard-shortcuts">Shortcuts</a> &middot;
   <a href="#lightroom-and-capture-one-integration">LR / C1 Integration</a>
 </p>
@@ -97,9 +96,7 @@ XMP sidecars are written the instant you pick or reject. Import your folder and 
 
 ## Get cull
 
-**[Buy a license](https://cull.lemonsqueezy.com/checkout/buy/3345aefa-2fc3-460c-bc67-d2afdcab29e5)** — $14.99 early bird, $29.99 after. One-time purchase, no subscription.
-
-Or build from source (MIT):
+**[Download](https://getcull.fyi)** a pre-built binary from the website, or build from source:
 
 ```
 cargo build --release
