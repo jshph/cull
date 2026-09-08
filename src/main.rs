@@ -4,9 +4,12 @@
 mod app;
 mod catalog;
 mod cli;
+mod editor;
 mod exif;
+mod export;
 mod license;
 mod preview;
+mod shoot;
 mod update;
 mod xmp;
 
@@ -31,9 +34,24 @@ enum Command {
     /// Show pick / reject / unrated counts
     Stats { folder: PathBuf },
 
-    /// Copy all picks to <folder>/_picks/
+    /// Export a fresh picks snapshot into Exports/
     Export { folder: PathBuf },
 
+    /// Create an empty shoot with Originals/ and Exports/
+    NewShoot { folder: PathBuf },
+    /// Open/refresh native editor views for this shoot
+    Handoff {
+        folder: PathBuf,
+        #[arg(long)]
+        editor: String,
+        /// Gracefully restart Lightroom Local to refresh cached metadata
+        #[arg(long)]
+        restart_lightroom: bool,
+    },
+    /// Browse a folder in an editor (Capture One requires an open session)
+    OpenFolder { folder: PathBuf, #[arg(long)] editor: String },
+    /// Install Cull's Lightroom Classic plugin
+    InstallLightroomPlugin,
     /// Mark a file: pick | reject | none
     Mark {
         file: PathBuf,
@@ -50,11 +68,35 @@ fn main() {
         Some(Command::Stats { folder }) => cli::cmd_stats(&folder),
         Some(Command::Export { folder }) => cli::cmd_export(&folder),
         Some(Command::Mark { file, mark }) => cli::cmd_mark(&file, mark),
+        Some(Command::NewShoot { folder }) => {
+            report(crate::shoot::create(&folder).map(|s| s.root.display().to_string()))
+        }
+        Some(Command::Handoff { folder, editor, restart_lightroom }) => {
+            report(if restart_lightroom {
+                crate::editor::restart_lightroom_and_handoff(&folder, &editor)
+            } else {
+                crate::editor::handoff(&folder, &editor)
+            })
+        }
+        Some(Command::OpenFolder { folder, editor }) => report(crate::editor::open_in_editor(&editor, &[folder]).map(|_| "Opened folder in editor".into())),
+        Some(Command::InstallLightroomPlugin) => {
+            report(crate::editor::install_lightroom_plugin().map(|p| p.display().to_string()))
+        }
         None => {
             // If a folder was explicitly passed, open it. Otherwise launch empty
             // — avoids scanning CWD (which is "/" when launched from Finder).
             let folder = cli.folder.map(|f| std::fs::canonicalize(&f).unwrap_or(f));
             run_gui(folder);
+        }
+    }
+}
+
+fn report(result: anyhow::Result<String>) {
+    match result {
+        Ok(message) => println!("{message}"),
+        Err(error) => {
+            eprintln!("{error:#}");
+            std::process::exit(1);
         }
     }
 }

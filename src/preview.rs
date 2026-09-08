@@ -1,6 +1,6 @@
+use anyhow::{anyhow, Result};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
-use anyhow::{anyhow, Result};
 
 const MAX_DIM: u32 = 2400;
 const THUMB_DIM: u32 = 300;
@@ -27,14 +27,13 @@ pub fn load_thumbnail(path: &Path, rotation: u8) -> Result<egui::ColorImage> {
 // ── shared decode ─────────────────────────────────────────────────────────
 
 fn decode_jpeg(jpeg: Vec<u8>, max_dim: u32, rotation: u8) -> Result<egui::ColorImage> {
-    let img = image::load_from_memory(&jpeg)
-        .map_err(|e| anyhow!("decode failed: {e}"))?;
+    let img = image::load_from_memory(&jpeg).map_err(|e| anyhow!("decode failed: {e}"))?;
 
     // Apply rotation before downscaling so aspect ratio is correct after rotate
     let img = match rotation {
         1 => img.rotate270(), // 90° CCW
         2 => img.rotate180(),
-        3 => img.rotate90(),  // 90° CW
+        3 => img.rotate90(), // 90° CW
         _ => img,
     };
 
@@ -61,8 +60,7 @@ fn extract_full_jpeg(path: &Path) -> Result<Vec<u8>> {
         return extract_raf_full_jpeg(&data)
             .ok_or_else(|| anyhow!("no JPEG preview in RAF {:?}", path));
     }
-    find_largest_jpeg(&data)
-        .ok_or_else(|| anyhow!("no embedded JPEG in {:?}", path))
+    find_largest_jpeg(&data).ok_or_else(|| anyhow!("no embedded JPEG in {:?}", path))
 }
 
 // ── tiny thumbnail extraction (fast path) ─────────────────────────────────
@@ -118,7 +116,9 @@ fn tiff_ifd1_jpeg_seekable(path: &Path) -> Option<Vec<u8>> {
     let n0 = rd16_file(&mut f, le)? as i64;
     f.seek(SeekFrom::Current(n0 * 12)).ok()?;
     let ifd1_off = rd32_file(&mut f, le)? as u64;
-    if ifd1_off == 0 { return None; }
+    if ifd1_off == 0 {
+        return None;
+    }
 
     // Parse IFD1 for JPEG thumbnail tags
     f.seek(SeekFrom::Start(ifd1_off)).ok()?;
@@ -139,14 +139,20 @@ fn tiff_ifd1_jpeg_seekable(path: &Path) -> Option<Vec<u8>> {
 
     let off = jpeg_off? as u64;
     let len = jpeg_len? as usize;
-    if len == 0 { return None; }
+    if len == 0 {
+        return None;
+    }
 
     f.seek(SeekFrom::Start(off)).ok()?;
     let mut thumb = vec![0u8; len];
     f.read_exact(&mut thumb).ok()?;
 
     // Validate JPEG magic
-    if thumb.get(0..2) == Some(&[0xFF, 0xD8]) { Some(thumb) } else { None }
+    if thumb.get(0..2) == Some(&[0xFF, 0xD8]) {
+        Some(thumb)
+    } else {
+        None
+    }
 }
 
 // ── RAF thumbnail ──────────────────────────────────────────────────────────
@@ -160,7 +166,9 @@ fn extract_raf_tiny(path: &Path) -> Option<Vec<u8>> {
 
     let mut hdr = [0u8; 100];
     f.read_exact(&mut hdr).ok()?;
-    if !hdr.starts_with(b"FUJIFILMCCD-RAW") { return None; }
+    if !hdr.starts_with(b"FUJIFILMCCD-RAW") {
+        return None;
+    }
 
     // Try standard offset 0x54 (84) first, then 0x44 (68) for older bodies.
     // RAF is always big-endian.
@@ -168,7 +176,11 @@ fn extract_raf_tiny(path: &Path) -> Option<Vec<u8>> {
         .iter()
         .filter_map(|&o| {
             let v = rd32(&hdr[o..], false)?;
-            if v > 0 { Some(v as u64) } else { None }
+            if v > 0 {
+                Some(v as u64)
+            } else {
+                None
+            }
         })
         .find(|&off| {
             f.seek(SeekFrom::Start(off)).ok();
@@ -193,11 +205,15 @@ fn extract_raf_tiny(path: &Path) -> Option<Vec<u8>> {
 // That TIFF block's IFD1 holds the thumbnail JPEG.
 
 fn exif_thumbnail_in_jpeg(data: &[u8]) -> Option<Vec<u8>> {
-    if data.get(0..2) != Some(&[0xFF, 0xD8]) { return None; }
+    if data.get(0..2) != Some(&[0xFF, 0xD8]) {
+        return None;
+    }
 
     let mut i = 2usize;
     while i + 4 <= data.len() {
-        if data[i] != 0xFF { break; }
+        if data[i] != 0xFF {
+            break;
+        }
         let marker = data[i + 1];
         let seg_len = u16::from_be_bytes([data[i + 2], data[i + 3]]) as usize;
 
@@ -212,7 +228,9 @@ fn exif_thumbnail_in_jpeg(data: &[u8]) -> Option<Vec<u8>> {
             }
         }
 
-        if marker == 0xDA { break; } // SOS — image data starts, no more APPs
+        if marker == 0xDA {
+            break;
+        } // SOS — image data starts, no more APPs
         i += 2 + seg_len;
     }
     None
@@ -221,7 +239,9 @@ fn exif_thumbnail_in_jpeg(data: &[u8]) -> Option<Vec<u8>> {
 /// Parse a TIFF block (in memory) and return the IFD1 JPEG thumbnail.
 /// Offsets are relative to the start of `data`.
 fn tiff_ifd1_jpeg_in_mem(data: &[u8]) -> Option<Vec<u8>> {
-    if data.len() < 8 { return None; }
+    if data.len() < 8 {
+        return None;
+    }
 
     let le = match data.get(0..2)? {
         b"II" => true,
@@ -234,7 +254,9 @@ fn tiff_ifd1_jpeg_in_mem(data: &[u8]) -> Option<Vec<u8>> {
 
     let ifd1_ptr = ifd0_off + 2 + n0 * 12;
     let ifd1_off = rd32(&data[ifd1_ptr..], le)? as usize;
-    if ifd1_off == 0 { return None; }
+    if ifd1_off == 0 {
+        return None;
+    }
 
     let n1 = rd16(&data[ifd1_off..], le)? as usize;
     let (mut jpeg_off, mut jpeg_len) = (None::<u32>, None::<u32>);
@@ -252,8 +274,12 @@ fn tiff_ifd1_jpeg_in_mem(data: &[u8]) -> Option<Vec<u8>> {
 
     let off = jpeg_off? as usize;
     let len = jpeg_len? as usize;
-    if off + len > data.len() || len == 0 { return None; }
-    if data[off] != 0xFF || data[off + 1] != 0xD8 { return None; }
+    if off + len > data.len() || len == 0 {
+        return None;
+    }
+    if data[off] != 0xFF || data[off + 1] != 0xD8 {
+        return None;
+    }
 
     Some(data[off..off + len].to_vec())
 }
@@ -261,14 +287,20 @@ fn tiff_ifd1_jpeg_in_mem(data: &[u8]) -> Option<Vec<u8>> {
 // ── RAF full preview (existing logic, kept here) ──────────────────────────
 
 fn extract_raf_full_jpeg(data: &[u8]) -> Option<Vec<u8>> {
-    try_raf_at(data, 84).or_else(|| try_raf_at(data, 68)).or_else(|| find_largest_jpeg(data))
+    try_raf_at(data, 84)
+        .or_else(|| try_raf_at(data, 68))
+        .or_else(|| find_largest_jpeg(data))
 }
 
 fn try_raf_at(data: &[u8], off_field: usize) -> Option<Vec<u8>> {
     let off = rd32(&data[off_field..], false)? as usize;
     let len = rd32(&data[off_field + 4..], false)? as usize;
-    if off == 0 || len == 0 || off + len > data.len() { return None; }
-    if data[off] != 0xFF || data[off + 1] != 0xD8 { return None; }
+    if off == 0 || len == 0 || off + len > data.len() {
+        return None;
+    }
+    if data[off] != 0xFF || data[off + 1] != 0xD8 {
+        return None;
+    }
     Some(data[off..off + len].to_vec())
 }
 
@@ -281,7 +313,11 @@ fn find_largest_jpeg(data: &[u8]) -> Option<Vec<u8>> {
         if data[i] == 0xFF && data[i + 1] == 0xD8 && data[i + 2] == 0xFF {
             if let Some(end) = jpeg_end(data, i) {
                 let len = end - i;
-                if best.map_or(true, |(_, bl)| len > bl) { best = Some((i, len)); }
+                // DNGs can contain a much larger SOF3 lossless JPEG holding
+                // Bayer RAW data. It is not a display preview.
+                if is_display_jpeg(&data[i..end]) && best.map_or(true, |(_, bl)| len > bl) {
+                    best = Some((i, len));
+                }
                 i = end;
                 continue;
             }
@@ -294,10 +330,111 @@ fn find_largest_jpeg(data: &[u8]) -> Option<Vec<u8>> {
 fn jpeg_end(data: &[u8], start: usize) -> Option<usize> {
     let mut i = start + 2;
     while i + 1 < data.len() {
-        if data[i] == 0xFF && data[i + 1] == 0xD9 { return Some(i + 2); }
-        i += 1;
+        if data[i] != 0xFF {
+            i += 1;
+            continue;
+        }
+        let marker = data[i + 1];
+        match marker {
+            0xD9 => return Some(i + 2),
+            0xFF => i += 1,
+            0x00 | 0xD0..=0xD7 | 0x01 => i += 2,
+            _ => {
+                // Skip length-delimited headers (including EXIF thumbnails),
+                // then scan entropy data, respecting escaped/restart markers.
+                let length = rd16(data.get(i + 2..)?, false)? as usize;
+                if length < 2 {
+                    return None;
+                }
+                i = i.checked_add(2 + length)?;
+                if i > data.len() {
+                    return None;
+                }
+            }
+        }
     }
     None
+}
+
+fn is_display_jpeg(data: &[u8]) -> bool {
+    let mut i = 2;
+    while i + 3 < data.len() && data[i] == 0xFF {
+        let marker = data[i + 1];
+        if marker == 0xFF {
+            i += 1;
+            continue;
+        }
+        // Only 8-bit sequential/progressive photographic previews.
+        if matches!(marker, 0xC0 | 0xC1 | 0xC2) {
+            return data.get(i + 4) == Some(&8);
+        }
+        if matches!(marker, 0xC3 | 0xC5..=0xC7 | 0xC9..=0xCB | 0xCD..=0xCF | 0xDA | 0xD9) {
+            return false;
+        }
+        let length = u16::from_be_bytes([data[i + 2], data[i + 3]]) as usize;
+        if length < 2 {
+            return false;
+        }
+        i += 2 + length;
+    }
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn jpeg() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new(&mut bytes)
+            .encode(&[80; 12], 2, 2, image::ExtendedColorType::Rgb8)
+            .unwrap();
+        bytes
+    }
+
+    #[test]
+    fn dng_uses_display_preview_instead_of_larger_lossless_raw() {
+        let preview = jpeg();
+        let mut raw = vec![0xFF, 0xD8, 0xFF, 0xC3, 0, 8, 14, 0, 2, 0, 2, 0];
+        raw.extend(vec![0; preview.len() * 2]);
+        raw.extend([0xFF, 0xD9]);
+        let mut dng = raw;
+        dng.extend(&preview);
+        assert_eq!(find_largest_jpeg(&dng).unwrap(), preview);
+        assert_eq!(
+            decode_jpeg(find_largest_jpeg(&dng).unwrap(), MAX_DIM, 0)
+                .unwrap()
+                .size,
+            [2, 2]
+        );
+    }
+
+    #[test]
+    fn embedded_exif_thumbnail_does_not_truncate_outer_preview() {
+        let preview = jpeg();
+        let thumbnail = jpeg();
+        let mut outer = vec![0xFF, 0xD8, 0xFF, 0xE1];
+        outer.extend(((thumbnail.len() + 2) as u16).to_be_bytes());
+        outer.extend(thumbnail);
+        outer.extend(&preview[2..]);
+        assert_eq!(find_largest_jpeg(&outer).unwrap(), outer);
+    }
+
+    #[test]
+    fn truncated_header_is_rejected() {
+        assert!(find_largest_jpeg(&[0xFF, 0xD8, 0xFF, 0xE1, 0xFF, 0xFF, 0xFF, 0xD9]).is_none());
+    }
+
+    #[test]
+    #[ignore = "set CULL_TEST_PHOTO to a local camera file"]
+    fn local_camera_preview() {
+        let photo = std::env::var_os("CULL_TEST_PHOTO").expect("CULL_TEST_PHOTO");
+        let path = Path::new(&photo);
+        let full = load_preview(path, 0).unwrap();
+        let thumb = load_thumbnail(path, 0).unwrap();
+        assert!(full.size[0] > 300 && full.size[1] > 300);
+        assert!(thumb.size[0] <= THUMB_DIM as usize && thumb.size[1] <= THUMB_DIM as usize);
+    }
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────
@@ -321,21 +458,37 @@ fn read_first_bytes(path: &Path, n: usize) -> Option<Vec<u8>> {
 // Endian-aware reads from byte slices
 fn rd16(data: &[u8], le: bool) -> Option<u16> {
     let b: [u8; 2] = data.get(0..2)?.try_into().ok()?;
-    Some(if le { u16::from_le_bytes(b) } else { u16::from_be_bytes(b) })
+    Some(if le {
+        u16::from_le_bytes(b)
+    } else {
+        u16::from_be_bytes(b)
+    })
 }
 fn rd32(data: &[u8], le: bool) -> Option<u32> {
     let b: [u8; 4] = data.get(0..4)?.try_into().ok()?;
-    Some(if le { u32::from_le_bytes(b) } else { u32::from_be_bytes(b) })
+    Some(if le {
+        u32::from_le_bytes(b)
+    } else {
+        u32::from_be_bytes(b)
+    })
 }
 
 // Endian-aware reads from file handle
 fn rd16_file(f: &mut std::fs::File, le: bool) -> Option<u16> {
     let mut b = [0u8; 2];
     f.read_exact(&mut b).ok()?;
-    Some(if le { u16::from_le_bytes(b) } else { u16::from_be_bytes(b) })
+    Some(if le {
+        u16::from_le_bytes(b)
+    } else {
+        u16::from_be_bytes(b)
+    })
 }
 fn rd32_file(f: &mut std::fs::File, le: bool) -> Option<u32> {
     let mut b = [0u8; 4];
     f.read_exact(&mut b).ok()?;
-    Some(if le { u32::from_le_bytes(b) } else { u32::from_be_bytes(b) })
+    Some(if le {
+        u32::from_le_bytes(b)
+    } else {
+        u32::from_be_bytes(b)
+    })
 }

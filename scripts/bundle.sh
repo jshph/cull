@@ -5,6 +5,11 @@ set -euo pipefail
 # Usage: ./scripts/bundle.sh
 # Output: dist/Cull.app and dist/Cull-<version>.dmg
 
+if [[ -n "${CULL_NOTARY_PROFILE:-}" && -z "${CULL_SIGNING_IDENTITY:-}" ]]; then
+    echo "CULL_NOTARY_PROFILE requires CULL_SIGNING_IDENTITY" >&2
+    exit 1
+fi
+
 VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
 BUNDLE_ID="com.getcull.cull"
 APP_NAME="Cull"
@@ -38,6 +43,8 @@ cat > "dist/${APP_NAME}.app/Contents/Info.plist" << PLIST
     <string>${VERSION}</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
+    <key>NSAppleEventsUsageDescription</key>
+    <string>Cull creates photo shoot sessions, updates pick tags, and restarts Lightroom when you request a metadata refresh.</string>
     <key>CFBundleExecutable</key>
     <string>cull</string>
     <key>CFBundleIconFile</key>
@@ -65,6 +72,12 @@ cat > "dist/${APP_NAME}.app/Contents/Info.plist" << PLIST
 </plist>
 PLIST
 
+plutil -lint "dist/${APP_NAME}.app/Contents/Info.plist"
+if [[ -n "${CULL_SIGNING_IDENTITY:-}" ]]; then
+    codesign --force --options runtime --timestamp --sign "${CULL_SIGNING_IDENTITY}" "dist/${APP_NAME}.app"
+    codesign --verify --deep --strict --verbose=2 "dist/${APP_NAME}.app"
+fi
+
 echo "    Created dist/${APP_NAME}.app"
 
 echo "==> Creating DMG..."
@@ -87,5 +100,16 @@ hdiutil convert "${DMG_TMP}" -format UDZO -o "${DMG_FINAL}"
 rm "${DMG_TMP}"
 
 echo ""
+if [[ -n "${CULL_SIGNING_IDENTITY:-}" ]]; then
+    codesign --force --timestamp --sign "${CULL_SIGNING_IDENTITY}" "${DMG_FINAL}"
+    codesign --verify --verbose=2 "${DMG_FINAL}"
+fi
+if [[ -n "${CULL_NOTARY_PROFILE:-}" ]]; then
+    xcrun notarytool submit "${DMG_FINAL}" --keychain-profile "${CULL_NOTARY_PROFILE}" --wait
+    xcrun stapler staple "${DMG_FINAL}"
+    xcrun stapler validate "${DMG_FINAL}"
+fi
+(cd dist && shasum -a 256 "${DMG_NAME}.dmg" > SHA256SUMS)
+
 echo "==> Done."
 ls -lh "${DMG_FINAL}"

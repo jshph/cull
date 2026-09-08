@@ -1,6 +1,6 @@
-use std::path::Path;
 use crate::catalog::{load_folder, Mark};
 use crate::xmp::write_mark;
+use std::path::Path;
 
 #[derive(clap::ValueEnum, Clone)]
 pub enum MarkArg {
@@ -38,33 +38,13 @@ pub fn cmd_stats(folder: &Path) {
 }
 
 pub fn cmd_export(folder: &Path) {
-    let images = load_folder(folder);
-    let picks: Vec<_> = images.iter().filter(|i| i.mark == Mark::Pick).collect();
-
-    if picks.is_empty() {
-        eprintln!("no picks found in {}", folder.display());
-        std::process::exit(1);
-    }
-
-    let dest_dir = folder.join("_picks");
-    std::fs::create_dir_all(&dest_dir).unwrap_or_else(|e| {
-        eprintln!("failed to create _picks/: {e}");
-        std::process::exit(1);
-    });
-
-    let mut copied = 0usize;
-    for img in &picks {
-        if let Some(name) = img.path.file_name() {
-            match std::fs::copy(&img.path, dest_dir.join(name)) {
-                Ok(_) => {
-                    println!("{}", img.path.display());
-                    copied += 1;
-                }
-                Err(e) => eprintln!("skip {}: {e}", img.path.display()),
-            }
+    match crate::shoot::export_snapshot(folder) {
+        Ok(path) => println!("{}", path.display()),
+        Err(error) => {
+            eprintln!("Export failed: {error:#}");
+            std::process::exit(1);
         }
     }
-    eprintln!("{copied} files copied to {}/", dest_dir.display());
 }
 
 pub fn cmd_mark(file: &Path, mark: MarkArg) {
@@ -72,6 +52,9 @@ pub fn cmd_mark(file: &Path, mark: MarkArg) {
         eprintln!("file not found: {}", file.display());
         std::process::exit(1);
     }
-    write_mark(file, &mark.into());
+    if let Err(error) = write_mark(file, &mark.into()) {
+        eprintln!("Could not save decision: {error:#}");
+        std::process::exit(1);
+    }
     println!("{}", file.display());
 }

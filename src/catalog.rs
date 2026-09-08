@@ -51,14 +51,24 @@ impl ImageEntry {
     }
 }
 
-fn collect_images(folder: &Path, max_depth: usize) -> Vec<ImageEntry> {
+fn collect_images(folder: &Path, max_depth: usize) -> anyhow::Result<Vec<ImageEntry>> {
     let all_exts: Vec<&str> = RAW_EXTS.iter().chain(JPEG_EXTS.iter()).cloned().collect();
 
-    walkdir::WalkDir::new(folder)
+    let entries = walkdir::WalkDir::new(folder)
         .max_depth(max_depth)
         .sort_by_file_name()
         .into_iter()
-        .filter_map(|e| e.ok())
+        .filter_entry(|entry| {
+            entry.depth() == 0
+                || !entry.file_type().is_dir()
+                || !matches!(
+                    entry.file_name().to_str(),
+                    Some(".cull" | "CaptureOne" | "_picks" | "Exports")
+                )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(entries
+        .into_iter()
         .filter(|e| e.file_type().is_file())
         .filter_map(|e| {
             let path = e.path().to_path_buf();
@@ -73,20 +83,30 @@ fn collect_images(folder: &Path, max_depth: usize) -> Vec<ImageEntry> {
                 let modified = std::fs::metadata(&path)
                     .and_then(|m| m.modified())
                     .unwrap_or(SystemTime::UNIX_EPOCH);
-                Some(ImageEntry { path, mark, rotation, modified, tags })
+                Some(ImageEntry {
+                    path,
+                    mark,
+                    rotation,
+                    modified,
+                    tags,
+                })
             } else {
                 None
             }
         })
-        .collect()
+        .collect())
+}
+
+pub fn try_load_folder(folder: &Path) -> anyhow::Result<Vec<ImageEntry>> {
+    let structured = folder.join("Originals");
+    let folder = if structured.is_dir() {
+        structured.as_path()
+    } else {
+        folder
+    };
+    collect_images(folder, usize::MAX)
 }
 
 pub fn load_folder(folder: &Path) -> Vec<ImageEntry> {
-    let images = collect_images(folder, 1);
-    if images.is_empty() {
-        // No direct images — gather from all subfolders
-        collect_images(folder, usize::MAX)
-    } else {
-        images
-    }
+    try_load_folder(folder).unwrap_or_default()
 }
